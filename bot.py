@@ -27,7 +27,7 @@ P = {
     "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
     "ffa_evidence": 4.0, "ffa_deaths": 4.0, "ffa_prey_hp": 350.0, "ffa_engage_r": 70.0, "ffa_retreat_hp": 0.5,
     "ffa_retreat_hp_multi": 0.65, "ffa_explore_until": 100.0,
-    "astar_budget": 0.02, "climb_max": 0.0, "loot_timeout": 20.0,
+    "astar_budget": 0.012, "climb_max": 0.0, "loot_timeout": 20.0,
     "heal_still_hp": 0.8, "seek_hp": 0.7, "lead_mem": 15.0, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
     "latency": 0.08, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
@@ -74,6 +74,10 @@ class Bot:
             map_dir = here
         self.W = World(map_dir, step_up=mech.get("step_up", 1.2), max_slope_deg=mech.get("max_slope_deg", 50),
                        mech_height=mech.get("height", 9))
+        import gc
+        gc.collect()
+        gc.freeze()                     # map arrays are permanent: keep the collector off them
+        gc.set_threshold(50000, 50, 100)
         self.wcfg = self.cfg["weapons"]
         self.path = None
         self.path_goal = None
