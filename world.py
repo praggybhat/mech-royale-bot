@@ -93,8 +93,11 @@ class World:
                         r = (j + dj) * nx
                         for di in (-1, 0, 1):
                             d = r + i + di
-                            ll = su if (isprism[d] or isprism[c]) else (sr * 1.414 if (di and dj) else sr)
-                            if surf[d] - h > ll:
+                            # clearance only from walls (buildings, bridges, stadium); a terrain slope is not a
+                            # wall: its steepness is enforced per move (uphill limit), and downhill is always ok
+                            if not isprism[d]:
+                                continue
+                            if surf[d] - h > su:
                                 ok = 0
                                 break
                         if not ok:
@@ -238,7 +241,8 @@ class World:
         return c
 
     # ---------------------------------------------------------------- A*
-    def astar(self, start_xy, goal_xy, budget_s: float = 0.012, penalty=None) -> Optional[List[Tuple[float, float]]]:
+    def astar(self, start_xy, goal_xy, budget_s: float = 0.012, penalty=None,
+              weight: float = 1.6) -> Optional[List[Tuple[float, float]]]:
         """Path of waypoints from start to goal. Directional edges: step up <= limit, any step down.
         Returns None if not found within budget (caller falls back to straight line)."""
         t0 = time.perf_counter()
@@ -253,7 +257,7 @@ class World:
         gs = {s: 0.0}
         came = {s: -1}
         h0 = math.hypot(s % nx - gi, s // nx - gj)
-        openq = [(h0, 0.0, s)]
+        openq = [(h0 * weight, 0.0, s)]
         closed = set()
         best_c, best_h = s, h0
         it = 0
@@ -296,7 +300,7 @@ class World:
                 if ng < gs.get(d, INF):
                     gs[d] = ng
                     came[d] = c
-                    heapq.heappush(openq, (ng + math.hypot(i - gi, j - gj), ng, d))
+                    heapq.heappush(openq, (ng + weight * math.hypot(i - gi, j - gj), ng, d))
         end = g if found else best_c
         if end == s:
             return None if not found else [tuple(goal_xy)]

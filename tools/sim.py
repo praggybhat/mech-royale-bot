@@ -123,6 +123,7 @@ class Sim:
         self.plan_zone()
         self.house_known = None  # shared vision: (t, pos, vel)
         self.stat = {}
+        self.sounds0 = []  # sounds heard by our bot (mech 0) since its last observation
 
     def rand_walk(self, margin):
         W = self.W
@@ -265,6 +266,17 @@ class Sim:
         return best, bt
 
     # ----------------------------------------------------------- step
+    def hear(self, src, kind, rng):
+        me = self.mechs[0]
+        if src is me or not me.alive:
+            return
+        d = math.hypot(src.pos[0] - me.pos[0], src.pos[1] - me.pos[1])
+        if d > rng:
+            return
+        b = math.atan2(src.pos[1] - me.pos[1], src.pos[0] - me.pos[0]) + self.rng.gauss(0, math.radians(7))
+        self.sounds0.append({"kind": kind, "bearing": wrap(b), "dist": "near" if d < 60 else "mid" if d < 160 else "far",
+                             "age": 0.0})
+
     def apply_action(self, m, a):
         cfg = self.cfg
         M = cfg["mech"]
@@ -283,6 +295,8 @@ class Sim:
             m.energy -= M["boost_drain"] * DT
             m.spent_t = self.t
         tvx, tvy = mx * spd, my * spd
+        if l > 0.45 and (self.tick // 2 + m.id) % 6 == 0:
+            self.hear(m, "boost" if boost else "step", 90 if boost else 40)
         acc = M["ground_accel"] * DT
         dvx, dvy = tvx - m.vel[0], tvy - m.vel[1]
         dl = math.hypot(dvx, dvy)
@@ -372,6 +386,8 @@ class Sim:
                              math.sin(pp) * st["speed"]]
                         if m.id == 0:
                             self.stat["shots"] = self.stat.get("shots", 0) + 1
+                        elif nshots == 0:
+                            self.hear(m, "gun", 320)
                         self.bullets.append({"o": m, "pos": o[:], "vel": v, "left": st["range"],
                                              "dmg": st["damage"], "id": self.next_id})
                         self.next_id += 1
@@ -695,7 +711,13 @@ class Sim:
                            math.hypot(o.pos[0] - m.pos[0], o.pos[1] - m.pos[1]) < 160],
                 "cubes": [c for c in self.cubes if vis_item(c["pos"])],
                 "pickups": [p for p in self.pickups if vis_item(p["pos"])],
-                "sounds": [], "beams": [], "events": ev, "zone": self.zone_obs(), "offer": m.offer, "drops": []}
+                "sounds": self.pop_sounds(m), "beams": [], "events": ev, "zone": self.zone_obs(), "offer": m.offer, "drops": []}
+
+    def pop_sounds(self, m):
+        if m.id != 0:
+            return []
+        out, self.sounds0 = self.sounds0, []
+        return out
 
     def run(self, mybot, max_t=480, verbose=False):
         me = self.mechs[0]

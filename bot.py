@@ -27,7 +27,8 @@ P = {
     "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
     "ffa_evidence": 4.0, "ffa_prey_hp": 350.0, "ffa_engage_r": 70.0, "ffa_retreat_hp": 0.5,
     "ffa_retreat_hp_multi": 0.65, "ffa_explore_until": 100.0,
-    "heal_still_hp": 0.8, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
+    "astar_budget": 0.02, "loot_timeout": 20.0,
+    "heal_still_hp": 0.8, "seek_hp": 0.7, "lead_mem": 15.0, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
     "latency": 0.08, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
 }
@@ -104,6 +105,14 @@ class Bot:
         self.ffa_evidence = 0.0
         self.prev_hp = {}
         self.ffa_victims = set()
+        self.mem_pk = {}      # id -> pickup dict   (items don't move: remember them across glances)
+        self.mem_cube = {}    # id -> cube dict
+        self.mem_crate = {}   # id -> crate dict
+        self.loot_commit = None
+        self.loot_since = 0.0
+        self.partial_goal = None
+        self.unreachable = []    # (t, x, y) goals the pathfinder could not reach
+        self.sound_leads = []   # (t, x, y): estimated positions of things we heard
         self.explore = None
         self.explore_until = -1.0
 
@@ -167,7 +176,12 @@ class Bot:
             if self.W.walk_line(p, goal) and hyp(p, goal) < 60:
                 self.path = [tuple(goal[:2])]
             else:
-                self.path = self.W.astar(p[:2], goal[:2], budget_s=0.014) or [tuple(goal[:2])]
+                path = self.W.astar(p[:2], goal[:2], budget_s=P["astar_budget"])
+                partial = bool(path) and hyp(path[-1], goal) > 6.0
+                if partial and self.partial_goal is not None and hyp(self.partial_goal, goal) < 3.0:
+                    self.unreachable.append((t, goal[0], goal[1]))
+                self.partial_goal = list(goal[:2]) if partial else None
+                self.path = path or [tuple(goal[:2])]
             self.path_goal = list(goal[:2])
             self.path_t = t
             self.path_i = 0
@@ -265,6 +279,10 @@ class Bot:
                 self.last_deal_t = t
             elif ty == "take_failed":
                 self.blocked_pickups[e["id"]] = t
+                if e.get("reason") == "gone":
+                    self.mem_pk.pop(e["id"], None)
+            elif ty == "took":
+                self.mem_pk.pop(e["id"], None)
         # ---------------- upgrades
         if obs.get("offer"):
             ch = obs["offer"]["choices"]
@@ -290,6 +308,14 @@ class Bot:
         for k in [k for k, v in self.last_seen.items() if t - v[0] > 12]:
             del self.last_seen[k]
         self.update_ffa(obs, enemies, npcs, me, t)
+        self.update_item_memory(obs, me, t)
+        for snd in obs["sounds"]:
+            if snd["kind"] in ("gun", "laser", "lightning", "mortar", "laser_charge", "step", "boost", "jet",
+                               "crate", "npc_gun", "reload", "explosion"):
+                est = {"near": 35.0, "mid": 110.0, "far": 230.0}.get(snd["dist"], 110.0)
+                b = snd["bearing"]
+                self.sound_leads.append((t - snd.get("age", 0), p[0] + math.cos(b) * est, p[1] + math.sin(b) * est))
+        self.sound_leads = [l for l in self.sound_leads if t - l[0] < P["lead_mem"]][-40:]
         for s in obs["sounds"]:
             if s["kind"] in ("gun", "laser", "lightning", "mortar", "laser_charge", "step", "boost", "jet") \
                     and s["dist"] in ("near", "mid"):
@@ -369,14 +395,14 @@ class Bot:
         drop_slot = None
         # value of the slot a pickup would replace: an empty slot is free, else our worst weapon
         weakest = 0.0 if None in weapons else min(WEAPON_VALUE[w["kind"]] for w in weapons if w)
-        for pk in obs["pickups"]:
-            if pk["kind"] in kinds or pk["id"] in self.blocked_pickups and t - self.blocked_pickups[pk["id"]] < 5:
+        for pk in list(self.mem_pk.values()):
+            if pk["kind"] in kinds or (pk["id"] in self.blocked_pickups and self.blocked_pickups[pk["id"]] > t - 5):
                 continue
             v = WEAPON_VALUE.get(pk["kind"], 0)
             if v <= weakest:
                 continue
             d = hyp(p, pk["pos"])
-            if d < self.cfg["loot"]["pickup_radius"] - 0.5 and abs(pk["pos"][2] - p[2]) < 3.5:
+            if d < self.cfg["loot"]["pickup_radius"] - 0.1 and abs(pk["pos"][2] - p[2]) < 3.9:
                 charging_laser = "laser" in kinds and (weapons[kinds["laser"]].get("charge", 0) > 0)
                 if not charging_laser:
                     take_id = pk["id"]
@@ -385,24 +411,28 @@ class Bot:
                         drop_slot = min((i for i, w in enumerate(weapons) if w),
                                         key=lambda i: WEAPON_VALUE[weapons[i]["kind"]])
             on_roof = pk["pos"][2] - self.W.ground(pk["pos"][0], pk["pos"][1]) > 3 and abs(pk["pos"][2] - p[2]) > 2.5
-            if on_roof or not self.safe_inside(pk["pos"], z, t, margin=5, horizon=20):
+            if on_roof or self.is_unreachable(pk["pos"], t) or not self.safe_inside(pk["pos"], z, t, margin=5, horizon=20):
                 continue
             score = d - v * 25
+            if self.loot_commit == pk["id"]:
+                score -= 30  # commitment: don't dither between items
             if loot_goal is None or score < loot_goal[0]:
-                loot_goal = (score, pk["pos"], "weapon")
+                loot_goal = (score, pk["pos"], "weapon", pk["id"])
         if take_id is not None:
             act["take"] = take_id
             if drop_slot is not None:
                 act["drop"] = drop_slot
-        for cb in obs["cubes"]:
+        for cb in list(self.mem_cube.values()):
+            if self.blocked_pickups.get(cb["id"], -1) > t or self.is_unreachable(cb["pos"], t):
+                continue
             d = hyp(p, cb["pos"])
             if cb["pos"][2] - self.W.ground(cb["pos"][0], cb["pos"][1]) > 3 and abs(cb["pos"][2] - p[2]) > 2.5:
                 continue
             if not self.safe_inside(cb["pos"], z, t, margin=5, horizon=15):
                 continue
-            score = d - 40
-            if d < 120 and (loot_goal is None or score < loot_goal[0]):
-                loot_goal = (score, cb["pos"], "cube")
+            score = d - 40 - (30 if self.loot_commit == cb["id"] else 0)
+            if d < 160 and (loot_goal is None or score < loot_goal[0]):
+                loot_goal = (score, cb["pos"], "cube", cb["id"])
         # supply drops: full heal + cubes
         drop_goal = None
         for dr in obs.get("drops", []):
@@ -418,7 +448,7 @@ class Bot:
         shoot_obj = None
         if target is None and not recently_hit:
             cands = []
-            for c in obs["crates"]:
+            for c in list(self.mem_crate.values()):
                 d = hyp(p, c["pos"])
                 if d < 70 and c["pos"][2] - self.W.ground(c["pos"][0], c["pos"][1]) < 3:
                     cands.append((d, c, "crate"))
@@ -456,7 +486,7 @@ class Bot:
         elif mode == "fight":
             move, boost = self.fight_move(me, target, kinds, weapons, z, t, hpf)
             # grab nearby cubes mid-fight (+HP, +damage) while still shooting
-            near_cubes = [c for c in obs["cubes"] if hyp(p, c["pos"]) < P["cube_fight_r"]
+            near_cubes = [c for c in self.mem_cube.values() if hyp(p, c["pos"]) < P["cube_fight_r"]
                           and abs(c["pos"][2] - p[2]) < 3.5]
             if near_cubes and hyp(p, target["pos"]) > 15:
                 cb = min(near_cubes, key=lambda c: hyp(p, c["pos"]))
@@ -477,6 +507,13 @@ class Bot:
                     boost = me["energy"] > 50 and hyp(p, drop_goal["pos"]) > 40
             elif loot_goal is not None and not under_fire:
                 mode = "loot:" + loot_goal[2]
+                if self.loot_commit != loot_goal[3]:
+                    self.loot_commit = loot_goal[3]
+                    self.loot_since = t
+                elif t - self.loot_since > P["loot_timeout"]:
+                    # can't reach it (ledge, roof, knoll): give up on it for a while
+                    self.blocked_pickups[loot_goal[3]] = t + 60
+                    self.loot_commit = None
                 move = self.nav(me, loot_goal[1], t)
             elif shoot_obj is not None:
                 mode = "farm:" + shoot_obj[1]
@@ -496,6 +533,9 @@ class Bot:
                 move = self.nav(me, prey, t)
             elif hpf < P["heal_still_hp"] and t - self.last_hit_t < 30 and self.safe_inside(p, z, t, 10, 15):
                 mode = "heal"  # stand still: silent, regenerating
+            elif not self.ffa and hpf >= P["seek_hp"] and (lead := self.pick_lead(p, z, t)) is not None:
+                mode = "seek"  # go toward what we heard: house bots only count if we kill them
+                move = self.nav(me, lead, t)
             else:
                 mode = "hold"
                 ex = self.explore_goal(p, z, t)
@@ -550,6 +590,38 @@ class Bot:
         self.mode = mode
         mf.draw.label(f"{mode} hp{me['hp']:.0f} e{me['energy']:.0f} {(time.perf_counter() - t0) * 1000:.0f}ms")
         return act
+
+    # ------------------------------------------------------------------ item memory
+    def is_unreachable(self, q, t):
+        for (ts, x, y) in self.unreachable:
+            if t - ts < 90 and math.hypot(q[0] - x, q[1] - y) < 4.0:
+                return True
+        return False
+
+    def update_item_memory(self, obs, me, t):
+        p = me["pos"]
+        eye = [p[0], p[1], p[2] + me.get("stats", {}).get("eye_height", 8)]
+        yaw = me["aim"][0]
+        half_fov = math.radians(self.cfg["vision"]["fov_deg"]) / 2
+        for mem, key in ((self.mem_pk, "pickups"), (self.mem_cube, "cubes"), (self.mem_crate, "crates")):
+            now = {it["id"]: it for it in obs.get(key, [])}
+            mem.update(now)
+            checks = 0
+            for iid in list(mem):
+                if iid in now:
+                    continue
+                q = mem[iid]["pos"]
+                d = hyp(p, q)
+                visible_spot = d < 40 or (d < 150 and abs(wrap(math.atan2(q[1] - p[1], q[0] - p[0]) - yaw)) < half_fov)
+                if not visible_spot:
+                    continue
+                if d < 40:
+                    del mem[iid]
+                    continue
+                if checks < 6:
+                    checks += 1
+                    if self.W.los(eye, [q[0], q[1], q[2] + 1.0], step=2.5):
+                        del mem[iid]
 
     # ------------------------------------------------------------------ match type
     def update_ffa(self, obs, enemies, npcs, me, t):
@@ -615,6 +687,19 @@ class Bot:
             s = d + hp * 0.1 + age * 15
             if s < bs:
                 bs, best = s, q
+        return best
+
+    def pick_lead(self, p, z, t):
+        best, bs = None, 1e9
+        for (ts, x, y) in self.sound_leads:
+            d = math.hypot(x - p[0], y - p[1])
+            if d < 15 or not self.W.in_bounds(x, y, 10):
+                continue
+            if not self.safe_inside((x, y), z, t, margin=10, horizon=d / 11.7 + 5):
+                continue
+            s = (t - ts) * 20 + d * 0.5
+            if s < bs:
+                bs, best = s, (x, y)
         return best
 
     def explore_goal(self, p, z, t):
