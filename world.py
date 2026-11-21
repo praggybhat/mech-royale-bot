@@ -93,7 +93,7 @@ class World:
                         r = (j + dj) * nx
                         for di in (-1, 0, 1):
                             d = r + i + di
-                            ll = su if (isprism[d] or isprism[c]) else sr
+                            ll = su if (isprism[d] or isprism[c]) else (sr * 1.414 if (di and dj) else sr)
                             if surf[d] - h > ll:
                                 ok = 0
                                 break
@@ -285,7 +285,7 @@ class World:
                 if not walk[d] or d in closed:
                     continue
                 dh = surf[d] - h
-                if dh > (su if (cp or isp[d]) else sr):
+                if dh > (su if (cp or isp[d]) else (sr * cost)):
                     continue
                 if di and dj:  # no corner cutting
                     if not walk[cj * nx + i] or not walk[j * nx + ci]:

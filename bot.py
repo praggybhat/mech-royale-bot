@@ -25,6 +25,8 @@ P = {
     "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
     "pref_laser": 150.0, "pref_gun": 100.0, "pref_lightning": 28.0,
     "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
+    "heal_still_hp": 0.8, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
+    "latency": 0.08, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
 }
 for _k in list(P):
@@ -95,6 +97,9 @@ class Bot:
         self.blocked_pickups = {}
         self.target_id = None
         self.charge_hold = 0.0
+        self.vhist = {}
+        self.explore = None
+        self.explore_until = -1.0
 
     # ------------------------------------------------------------------ helpers
     def zone_now(self, z, t):
@@ -127,6 +132,17 @@ class Bot:
             return [me_xy[0], me_xy[1]]
         ux, uy = norm2(me_xy[0] - nc[0], me_xy[1] - nc[1])
         return [nc[0] + ux * lim, nc[1] + uy * lim]
+
+    def smooth_vel(self, m, flight):
+        """Blend instantaneous velocity with the recent average: strafing targets revert to their mean."""
+        v = m.get("vel", [0.0, 0.0, 0.0])
+        h = self.vhist.get(m["id"])
+        if not h or len(h) < 3 or h[-1][0] - h[0][0] < 0.3:
+            return v
+        dt = h[-1][0] - h[0][0]
+        ax, ay = (h[-1][1] - h[0][1]) / dt, (h[-1][2] - h[0][2]) / dt
+        k = max(0.0, min(1.0, 1.0 - flight / P["vel_blend_t"]))
+        return [v[0] * k + ax * (1 - k), v[1] * k + ay * (1 - k), v[2]]
 
     def center_of(self, m):
         scale = 1 + 0.05 * m.get("cubes", 0) if m["kind"] == "mech" else 1
@@ -186,13 +202,13 @@ class Bot:
     # ------------------------------------------------------------------ aiming
     def lead(self, src, tgt_pos, tgt_vel, speed):
         tx, ty, tz = tgt_pos
-        tt = 0.0
+        tt = P["latency"]
         for _ in range(3):
             px = tgt_pos[0] + tgt_vel[0] * tt
             py = tgt_pos[1] + tgt_vel[1] * tt
             pz = tgt_pos[2] + tgt_vel[2] * tt * 0.5
             d = math.sqrt((px - src[0]) ** 2 + (py - src[1]) ** 2 + (pz - src[2]) ** 2)
-            tt = d / speed
+            tt = d / speed + P["latency"]
             tx, ty, tz = px, py, pz
         return [tx, ty, tz]
 
@@ -257,8 +273,14 @@ class Bot:
         kinds = {w["kind"]: i for i, w in enumerate(weapons) if w}
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech" and m["id"] != me["id"]]
         npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
-        for m in enemies:
-            self.last_seen[m["id"]] = (t, m["pos"], m["vel"], m.get("hp", 1400))
+        for m in enemies + npcs:
+            if m["kind"] == "mech":
+                self.last_seen[m["id"]] = (t, m["pos"], m["vel"], m.get("hp", 1400))
+            h = self.vhist.setdefault(m["id"], [])
+            if not h or h[-1][0] < t:
+                h.append((t, m["pos"][0], m["pos"][1]))
+            while len(h) > 2 and t - h[0][0] > P["vel_window"]:
+                h.pop(0)
         for k in [k for k, v in self.last_seen.items() if t - v[0] > 12]:
             del self.last_seen[k]
         for s in obs["sounds"]:
@@ -405,12 +427,12 @@ class Bot:
             move = self.nav(me, goal, t, urgent=True)
             if target is not None:
                 aim_point = self.center_of(target)
-                aim_vel = target["vel"]
+                aim_vel = self.smooth_vel(target, hyp(p, target["pos"]) / 252.0)
         elif mode == "retreat":
             move, boost = self.retreat_move(me, enemies, z, t, hpf)
             if target is not None:
                 aim_point = self.center_of(target)
-                aim_vel = target["vel"]
+                aim_vel = self.smooth_vel(target, hyp(p, target["pos"]) / 252.0)
         elif mode == "fight":
             move, boost = self.fight_move(me, target, kinds, weapons, z, t, hpf)
             # grab nearby cubes mid-fight (+HP, +damage) while still shooting
@@ -426,7 +448,7 @@ class Bot:
                 move = self.nav(me, loot_goal[1], t, urgent=True)
                 mode = "fight:weapon"
             aim_point = self.center_of(target)
-            aim_vel = target["vel"]
+            aim_vel = self.smooth_vel(target, hyp(p, target["pos"]) / 252.0)
         else:
             if drop_goal is not None and not under_fire:
                 mode = "drop"
@@ -448,9 +470,19 @@ class Bot:
                 mode = "hunted"
                 # hit by something unseen: get moving, break line, turn toward it
                 move, boost = self.retreat_move(me, [], z, t, hpf)
+            elif (prey := self.pick_prey(p, t, z, hpf)) is not None:
+                # a remembered enemy: go finish it (kills are what score)
+                mode = "hunt"
+                move = self.nav(me, prey, t)
+            elif hpf < P["heal_still_hp"] and t - self.last_hit_t < 30 and self.safe_inside(p, z, t, 10, 15):
+                mode = "heal"  # stand still: silent, regenerating
             else:
                 mode = "hold"
-                if dist_home > 8:
+                ex = self.explore_goal(p, z, t)
+                if ex is not None:
+                    mode = "explore"
+                    move = self.nav(me, ex, t)
+                elif dist_home > 8:
                     move = self.nav(me, home, t)
                     move = (move[0] * 0.8, move[1] * 0.8)
             if shoot_obj is not None and aim_point is None:
@@ -498,6 +530,48 @@ class Bot:
         return act
 
     # ------------------------------------------------------------------ behaviors
+    def pick_prey(self, p, t, z, hpf):
+        """Last known position of a recently seen enemy worth chasing, or None."""
+        if hpf < P["hunt_hp"]:
+            return None
+        best, bs = None, 1e9
+        for mid, (ts, pos, vel, hp) in self.last_seen.items():
+            age = t - ts
+            if age > P["hunt_mem"]:
+                continue
+            q = [pos[0] + vel[0] * min(age, 2.0), pos[1] + vel[1] * min(age, 2.0)]
+            d = hyp(p, q)
+            if d > P["hunt_r"] or d < 4:
+                continue
+            if not self.safe_inside(q, z, t, margin=8, horizon=d / 11.7 + 5):
+                continue
+            s = d + hp * 0.1 + age * 15
+            if s < bs:
+                bs, best = s, q
+        return best
+
+    def explore_goal(self, p, z, t):
+        """Wander inside the next circle to find crates, drones and loot."""
+        if t > P["explore_until"]:
+            return None
+        if self.explore is not None and hyp(p, self.explore) > 6 and t < self.explore_until:
+            return self.explore
+        nc, nr = z["next_center"], z["next_radius"]
+        zc, zr = self.zone_now(z, t)
+        for _ in range(16):
+            a = self.rng.random() * TAU
+            r = 40 + self.rng.random() * 110
+            q = (p[0] + math.cos(a) * r, p[1] + math.sin(a) * r)
+            if not self.W.in_bounds(q[0], q[1], 20) or not self.W.walk[self.W.cell(*q)] \
+                    or self.W.isprism[self.W.cell(*q)]:
+                continue
+            if hyp(q, zc) > zr - 25 or (nr > 30 and hyp(q, nc) > nr * 0.9):
+                continue
+            self.explore = q
+            self.explore_until = t + 25
+            return q
+        return None
+
     def fight_move(self, me, target, kinds, weapons, z, t, hpf):
         p = me["pos"]
         tp = target["pos"]

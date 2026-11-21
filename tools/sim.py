@@ -27,6 +27,8 @@ from world import World  # noqa: E402
 DT = 0.1
 HOUSE_ACC = float(os.environ.get("HOUSE_ACC", "1.0"))
 HOUSE_FIRE = float(os.environ.get("HOUSE_FIRE", "0.6"))
+WAVES = os.environ.get("WAVES", "1") == "1"   # house bots engage weakest tier first
+TIER_RANK = {"easy": 0, "medium": 1, "hard": 2, "expert": 3}
 
 
 def wrap(a):
@@ -69,6 +71,17 @@ class Mech:
         return [w["kind"] for w in self.weapons if w]
 
 
+class Obj:
+    def __init__(self, oid, kind, pos, hp, radius, height):
+        self.id, self.kind, self.pos, self.hp = oid, kind, list(pos), hp
+        self.radius, self.height, self.alive = radius, height, True
+        self.home = list(pos)
+        self.cubes = 0
+        self.vel = [0.0, 0.0, 0.0]
+        self.aggro = None
+        self.cd = 0.0
+
+
 class Sim:
     def __init__(self, W, cfg, seed, tiers):
         self.W = W
@@ -96,6 +109,13 @@ class Sim:
             k = self.rng.choice(["mortar", "laser", "lightning"])
             self.pickups.append({"id": self.next_id, "kind": k, "pos": [x, y, W.surface(x, y)]})
             self.next_id += 1
+        self.objs = []
+        for k in range(cfg["crates"]["count"]):
+            x, y = self.rand_walk(margin=20)
+            self.objs.append(Obj(1000 + k, "crate", [x, y, W.surface(x, y)], cfg["crates"]["hp"], 1.4, 2.4))
+        for k in range(cfg["npc"]["count"]):
+            x, y = self.rand_walk(margin=30)
+            self.objs.append(Obj(100 + k, "npc", [x, y, W.surface(x, y)], cfg["npc"]["hp"], 1.8, 3.5))
         z = cfg["zone"]
         self.zphase = 0
         self.zc, self.zr = list(z["start_center"]), z["start_radius"]
@@ -162,6 +182,26 @@ class Sim:
     def damage(self, src, dst, amount, weapon, origin):
         if not dst.alive:
             return
+        if isinstance(dst, Obj):
+            mult = (1 + 0.04 * min(src.cubes, 10)) if src else 1
+            dst.hp -= amount * mult
+            if src:
+                src.events.append({"type": "hit", "target": dst.id, "amount": amount * mult, "weapon": weapon})
+                if src.id == 0:
+                    self.stat["dealt_obj"] = self.stat.get("dealt_obj", 0) + amount * mult
+                if dst.kind == "npc":
+                    dst.aggro = src
+            if dst.hp <= 0:
+                dst.alive = False
+                n = 1 if dst.kind == "crate" else 2
+                for k in range(n):
+                    self.cubes.append({"id": self.cube_id, "pos": [dst.pos[0] + k, dst.pos[1], dst.pos[2]]})
+                    self.cube_id += 1
+                if dst.kind == "crate" and self.rng.random() < 0.5:
+                    self.pickups.append({"id": self.next_id, "kind": self.rng.choice(["mortar", "laser", "lightning"]),
+                                         "pos": [dst.pos[0] - 1, dst.pos[1], dst.pos[2]]})
+                    self.next_id += 1
+            return
         bearing = math.atan2(origin[1] - dst.pos[1], origin[0] - dst.pos[0])
         rear = abs(wrap(bearing - dst.aim[0])) > math.pi / 2
         mult = (1 + 0.04 * min(src.cubes, 10)) if src else 1
@@ -200,11 +240,14 @@ class Sim:
     def ray_hit(self, shooter, o, d, rng):
         """First mech hit by a ray from o along unit d within rng (cylinder test)."""
         best, bt = None, rng
-        for m in self.mechs:
+        for m in self.mechs + self.objs:
             if not m.alive or m is shooter:
                 continue
-            r = 2.5 * (1 + 0.05 * m.cubes)
-            h = 9 * (1 + 0.05 * m.cubes)
+            if isinstance(m, Obj):
+                r, h = m.radius, m.height
+            else:
+                r = 2.5 * (1 + 0.05 * m.cubes)
+                h = 9 * (1 + 0.05 * m.cubes)
             fx, fy = m.pos[0] - o[0], m.pos[1] - o[1]
             dd = d[0] * d[0] + d[1] * d[1]
             if dd < 1e-9:
@@ -254,8 +297,9 @@ class Sim:
             c1 = W.cell(nxp, nyp)
             if not W.in_bounds(nxp, nyp, 3):
                 continue
-            ok = W.walk[c1] or W.surf[c1] <= W.surf[c0] - 0.5
-            if ok and W.surf[c1] - W.surf[c0] <= (1.2 if (W.isprism[c0] or W.isprism[c1]) else W.slope_rise):
+            ok = c1 == c0 or W.walk[c1] or W.surf[c1] <= W.surf[c0] - 0.5
+            diag = 1.414 if (c1 % W.nx != c0 % W.nx and c1 // W.nx != c0 // W.nx) else 1.0
+            if ok and W.surf[c1] - W.surf[c0] <= (1.2 if (W.isprism[c0] or W.isprism[c1]) else W.slope_rise * diag):
                 m.pos[0], m.pos[1] = nxp, nyp
                 m.pos[2] = W.surf[c1]
                 if (vx, vy) != (m.vel[0], m.vel[1]):
@@ -360,7 +404,8 @@ class Sim:
                     m.spent_t = self.t
                     w["cooldown"] = st["cooldown"]
                     best, bd = None, st["range"]
-                    for e in self.mechs:
+                    for e in self.mechs + [o for o in self.objs if o.alive and
+                                           math.hypot(o.pos[0] - m.pos[0], o.pos[1] - m.pos[1]) < 50]:
                         if e is m or not e.alive:
                             continue
                         dd = math.hypot(e.pos[0] - m.pos[0], e.pos[1] - m.pos[1])
@@ -447,6 +492,25 @@ class Sim:
                         if m is s["o"]:
                             dmg *= 0.5
                         self.damage(s["o"], m, dmg, "mortar", p)
+        # npc drones: shoot their attacker (or mechs close to home)
+        for o in self.objs:
+            if not o.alive or o.kind != "npc":
+                continue
+            o.cd -= DT
+            tgt = o.aggro if (o.aggro is not None and o.aggro.alive and
+                              math.hypot(o.aggro.pos[0] - o.pos[0], o.aggro.pos[1] - o.pos[1]) < 90) else None
+            if tgt is None:
+                o.aggro = None
+                for m in self.mechs:
+                    if m.alive and math.hypot(m.pos[0] - o.pos[0], m.pos[1] - o.pos[1]) < 45:
+                        tgt = m
+                        break
+            if tgt is not None and o.cd <= 0:
+                o.cd = 1.0
+                d = math.hypot(tgt.pos[0] - o.pos[0], tgt.pos[1] - o.pos[1])
+                if self.W.los([o.pos[0], o.pos[1], o.pos[2] + 3], [tgt.pos[0], tgt.pos[1], tgt.pos[2] + 4.5]) \
+                        and self.rng.random() < max(0.15, 0.8 - d / 120):
+                    self.damage(None, tgt, 25, "npc", o.pos)
         # zone, regen, energy
         zc, zr = self.zone_now()
         for m in self.mechs:
@@ -471,55 +535,87 @@ class Sim:
 
     # ----------------------------------------------------------- house AI
     def house_act(self, m, me):
+        """House bot: shares vision of us, hunts us, strafes unpredictably, uses whatever it holds."""
         tier = m.tier
-        acc = {"easy": 0.12, "medium": 0.06, "hard": 0.03, "expert": 0.015}[tier] * HOUSE_ACC
+        acc = {"easy": 0.10, "medium": 0.05, "hard": 0.025, "expert": 0.012}[tier] * HOUSE_ACC
         lead = tier != "easy"
         a = {"tick": self.tick}
         zc, zr = self.zone_now()
+        kinds = m.kinds()
         target = None
-        if me.alive and self.house_known and self.t - self.house_known[0] < 1.0:
+        active = True
+        if WAVES:
+            low = min(TIER_RANK[h.tier] for h in self.mechs[1:] if h.alive)
+            active = TIER_RANK[tier] <= low
+            # inactive bots still defend themselves when we're close
+            if not active and me.alive and math.hypot(me.pos[0] - m.pos[0], me.pos[1] - m.pos[1]) < 60 \
+                    and self.sees(m, me):
+                active = True
+        if active and me.alive and self.house_known and self.t - self.house_known[0] < 1.0:
             target = self.house_known
-        if target is None and me.alive and self.house_known and self.t - self.house_known[0] < 25:
-            goal = self.house_known[1]
-        else:
-            goal = self.znc if math.hypot(m.pos[0] - self.znc[0], m.pos[1] - self.znc[1]) > self.znr * 0.5 else None
+        goal = None
+        if target is None:
+            # grab a laser/lightning nearby when the slot is empty
+            if m.weapons[1] is None and tier != "easy":
+                best = None
+                for pk in self.pickups:
+                    if pk["kind"] == "mortar":
+                        continue
+                    d = math.hypot(pk["pos"][0] - m.pos[0], pk["pos"][1] - m.pos[1])
+                    if d < 90 and (best is None or d < best[0]):
+                        best = (d, pk)
+                if best:
+                    goal = best[1]["pos"]
+            if goal is None and active and me.alive and self.house_known and self.t - self.house_known[0] < 30:
+                goal = self.house_known[1]
+            if goal is None and math.hypot(m.pos[0] - self.znc[0], m.pos[1] - self.znc[1]) > self.znr * 0.5:
+                goal = self.znc
         if math.hypot(m.pos[0] - zc[0], m.pos[1] - zc[1]) > zr - 10:
-            goal = self.znc
+            goal, target = self.znc, None
         mv = [0.0, 0.0]
+        if not hasattr(m, "sdir"):
+            m.sdir, m.suntil = 1, 0.0
         if target is not None:
             tp = target[1]
             d = math.hypot(tp[0] - m.pos[0], tp[1] - m.pos[1])
             ux, uy = (tp[0] - m.pos[0]) / max(d, 1e-6), (tp[1] - m.pos[1]) / max(d, 1e-6)
-            pref = {"easy": 40, "medium": 50, "hard": 60, "expert": 50}[tier]
+            if "lightning" in kinds:
+                pref = 30
+            else:
+                pref = {"easy": 60, "medium": 55, "hard": 45, "expert": 40}[tier]
             r = max(-1, min(1, (d - pref) / 20))
-            s = 1 if (int(self.t / 1.5) + m.id) % 2 else -1
-            sl = 0.0 if tier == "easy" else 0.8
-            mv = [ux * r - uy * s * sl, uy * r + ux * s * sl]
+            if self.t > m.suntil:
+                if self.rng.random() < 0.7:
+                    m.sdir = -m.sdir
+                m.suntil = self.t + self.rng.uniform(0.5, 1.4)
+            sl = 0.3 if tier == "easy" else 0.9
+            mv = [ux * r - uy * m.sdir * sl, uy * r + ux * m.sdir * sl]
             src = [m.pos[0], m.pos[1], m.pos[2] + 7]
             c = [tp[0], tp[1], tp[2] + 4.5]
             if lead:
-                tt = d / 252
+                tt = d / 252 + 0.05
                 c = [c[0] + target[2][0] * tt, c[1] + target[2][1] * tt, c[2]]
             yaw = math.atan2(c[1] - src[1], c[0] - src[0]) + self.rng.gauss(0, acc)
-            pitch = math.atan2(c[2] - src[2], d)
+            pitch = math.atan2(c[2] - src[2], d) + self.rng.gauss(0, acc * 0.5)
             a["aim"] = [yaw, pitch]
             err = abs(wrap(m.aim[0] - yaw))
-            vis = self.W.los(src, c)
+            vis = self.W.los(src, [tp[0], tp[1], tp[2] + 4.5])
             fire = [False, False]
             for i, w in enumerate(m.weapons):
                 if not w:
                     continue
                 if w["kind"] == "gun":
-                    fire[i] = vis and err < 0.08 and d < 230 and self.rng.random() < HOUSE_FIRE
+                    fire[i] = vis and err < 0.06 and d < 230 and self.rng.random() < HOUSE_FIRE
                 elif w["kind"] == "laser":
-                    fire[i] = vis and (w.get("charge", 0) < w["stats"]["charge"] or err > 0.03)
+                    fire[i] = vis and d < 270 and (w.get("charge", 0) < w["stats"]["charge"] or err > 0.02)
                 elif w["kind"] == "lightning":
-                    fire[i] = vis and d < 45
+                    fire[i] = vis and d < 44 and err < 0.2 and m.energy > 5
             a["fire"] = fire
         elif goal is not None:
             d = math.hypot(goal[0] - m.pos[0], goal[1] - m.pos[1])
-            if d > 5:
-                if not hasattr(m, "path") or m.path_t + 3 < self.t or not m.path:
+            if d > 3:
+                if not hasattr(m, "path") or m.path_t + 3 < self.t or not m.path or \
+                        math.hypot(m.path[-1][0] - goal[0], m.path[-1][1] - goal[1]) > 10:
                     m.path = self.W.astar(m.pos[:2], goal[:2], budget_s=0.004) or [tuple(goal[:2])]
                     m.path_t = self.t
                     m.pi = 0
@@ -531,16 +627,19 @@ class Sim:
                 mv = [(wp[0] - m.pos[0]) / dd, (wp[1] - m.pos[1]) / dd]
                 a["aim"] = [math.atan2(mv[1], mv[0]), 0.0]
         a["move"] = mv
-        # expert/hard bots grab a laser/lightning if standing on one
-        if tier in ("hard", "expert") and m.weapons[1] is None:
-            for pk in self.pickups:
-                if math.hypot(pk["pos"][0] - m.pos[0], pk["pos"][1] - m.pos[1]) < 4 and pk["kind"] != "mortar":
-                    a["take"] = pk["id"]
-                    break
+        for pk in self.pickups:
+            if math.hypot(pk["pos"][0] - m.pos[0], pk["pos"][1] - m.pos[1]) < 4 and pk["kind"] != "mortar" \
+                    and pk["kind"] not in kinds and m.weapons[1] is None and tier != "easy":
+                a["take"] = pk["id"]
+                break
         return a
 
     # ----------------------------------------------------------- our obs
     def obs_for(self, m):
+        def vis_item(p):
+            dx, dy = p[0] - m.pos[0], p[1] - m.pos[1]
+            d = math.hypot(dx, dy)
+            return d < 45 or (d < 200 and abs(wrap(math.atan2(dy, dx) - m.aim[0])) < math.radians(60))
         seen = []
         for e in self.mechs:
             if e is m or not e.alive:
@@ -570,7 +669,14 @@ class Sim:
                          "max_hp": m.max_hp, "energy": m.energy, "max_energy": 100, "grounded": True,
                          "cubes": m.cubes, "upgrades": [], "weapons": json.loads(json.dumps(m.weapons)),
                          "in_zone": math.hypot(m.pos[0] - zc[0], m.pos[1] - zc[1]) < zr, "stats": stats},
-                "mechs": seen, "projectiles": projs, "crates": [],
+                "mechs": seen + [{"id": o.id, "kind": "npc", "pos": o.pos[:], "vel": [0.0, 0.0, 0.0], "aim": [0, 0],
+                                  "hp": o.hp, "max_hp": 350} for o in self.objs
+                                 if o.alive and o.kind == "npc" and vis_item(o.pos) and
+                                 math.hypot(o.pos[0] - m.pos[0], o.pos[1] - m.pos[1]) < 160],
+                "projectiles": projs,
+                "crates": [{"id": o.id, "pos": o.pos[:], "hp": o.hp} for o in self.objs
+                           if o.alive and o.kind == "crate" and vis_item(o.pos) and
+                           math.hypot(o.pos[0] - m.pos[0], o.pos[1] - m.pos[1]) < 160],
                 "cubes": [c for c in self.cubes if vis_item(c["pos"])],
                 "pickups": [p for p in self.pickups if vis_item(p["pos"])],
                 "sounds": [], "beams": [], "events": ev, "zone": self.zone_obs(), "offer": m.offer, "drops": []}
