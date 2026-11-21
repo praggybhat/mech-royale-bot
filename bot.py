@@ -32,6 +32,7 @@ P = {
     "heal_still_hp": 0.95, "seek_hp": 2.0, "lead_mem": 15.0, "hunt_hp": 2.0, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
     "latency": 0.08, "inst_lead": 0.1,
     "strafe_min": 0.5, "strafe_span": 1.0, "retreat_threat": 1.0,
+    "farm_crate_r": 70.0, "farm_npc_r": 75.0, "farm_crate_hp": 0.45, "farm_npc_hp": 0.5,
     "arm_r": 220.0, "arm_fight_r": 50.0, "arm_fight_r2": 90.0, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
 }
@@ -117,6 +118,7 @@ class Bot:
         self.mem_pk = {}      # id -> pickup dict   (items don't move: remember them across glances)
         self.mem_cube = {}    # id -> cube dict
         self.mem_crate = {}   # id -> crate dict
+        self.mem_npc = {}     # id -> {"id", "pos", "hp", "t"}
         self.loot_commit = None
         self.loot_since = 0.0
         self.partial_goal = None
@@ -400,6 +402,13 @@ class Bot:
             del self.last_seen[k]
         self.update_ffa(obs, enemies, npcs, me, t)
         self.update_item_memory(obs, me, t)
+        for n in npcs:
+            self.mem_npc[n["id"]] = {"id": n["id"], "pos": n["pos"], "hp": n.get("hp", 350), "t": t}
+        for e in obs["events"]:
+            if e["type"] == "hit" and 100 <= e.get("target", 0) < 1000 and e["target"] in self.mem_npc:
+                self.mem_npc[e["target"]]["hp"] -= e.get("amount", 0)
+        for k in [k for k, v in self.mem_npc.items() if t - v["t"] > 25 or v["hp"] <= 0]:
+            del self.mem_npc[k]
         for snd in obs["sounds"]:
             if snd["kind"] in ("gun", "laser", "lightning", "mortar", "laser_charge", "step", "boost", "jet",
                                "crate", "npc_gun", "reload", "explosion"):
@@ -562,24 +571,31 @@ class Bot:
                 arm_goal = best[1]
 
         # shootables when idle
+        # farming: crates (1 cube, maybe a weapon) and NPC drones (2 cubes) from memory, actively
         shoot_obj = None
-        if target is None and not recently_hit:
+        farm_goal = None
+        if target is None and t - self.last_hit_t > 1.5:
             cands = []
-            for c in list(self.mem_crate.values()):
-                d = hyp(p, c["pos"])
-                if d < 70 and c["pos"][2] - self.W.ground(c["pos"][0], c["pos"][1]) < 3:
-                    cands.append((d, c, "crate"))
-            if hpf > 0.6:
-                for n in npcs:
+            if hpf > P["farm_crate_hp"]:
+                for c in list(self.mem_crate.values()):
+                    d = hyp(p, c["pos"])
+                    if d < P["farm_crate_r"] and c["pos"][2] - self.W.ground(c["pos"][0], c["pos"][1]) < 3 \
+                            and not self.is_unreachable(c["pos"], t) \
+                            and self.safe_inside(c["pos"], z, t, margin=5, horizon=d / speed + 8):
+                        cands.append((d + 5, c, "crate"))
+            if hpf > P["farm_npc_hp"]:
+                for n in list(self.mem_npc.values()):
                     d = hyp(p, n["pos"])
-                    if d < 75:
-                        cands.append((d - 10, n, "npc"))
+                    if d < P["farm_npc_r"] and self.safe_inside(n["pos"], z, t, margin=5, horizon=d / speed + 8):
+                        cands.append((d - 20, n, "npc"))
             cands.sort(key=lambda c: c[0])
-            for d, o, k in cands[:3]:
+            for sc, o, k in cands[:4]:
                 cpt = [o["pos"][0], o["pos"][1], o["pos"][2] + (1.75 if k == "npc" else 1.2)]
-                if self.W.los(muzzle, cpt):
+                if hyp(p, o["pos"]) < 120 and self.W.los(muzzle, cpt):
                     shoot_obj = (o, k, cpt)
                     break
+            if cands:
+                farm_goal = cands[0]
 
         if arm_goal is not None and mode in ("fight", "hold", "avoid"):
             close = target is not None and (hyp(p, target["pos"]) < P["arm_fight_r"] or
@@ -645,13 +661,14 @@ class Bot:
                     self.blocked_pickups[loot_goal[3]] = t + 60
                     self.loot_commit = None
                 move = self.nav(me, loot_goal[1], t)
-            elif shoot_obj is not None:
-                mode = "farm:" + shoot_obj[1]
-                o = shoot_obj[0]
+            elif shoot_obj is not None or farm_goal is not None:
+                o, k = (shoot_obj[0], shoot_obj[1]) if shoot_obj is not None else (farm_goal[1], farm_goal[2])
+                mode = "farm:" + k
                 d = hyp(p, o["pos"])
-                if d > 35:
+                stand = 30.0 if k == "crate" else 38.0
+                if shoot_obj is None or d > stand:
                     move = self.nav(me, o["pos"], t)
-                elif d < 12:
+                elif d < 12 and k == "npc":
                     move = norm2(p[0] - o["pos"][0], p[1] - o["pos"][1])
             elif under_fire and target is None:
                 mode = "hunted"
