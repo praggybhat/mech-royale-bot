@@ -31,6 +31,7 @@ P = {
     "astar_budget": 0.012, "climb_max": 0.0, "loot_timeout": 20.0,
     "heal_still_hp": 0.8, "seek_hp": 0.7, "lead_mem": 15.0, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
     "latency": 0.08, "inst_lead": 0.1,
+    "strafe_min": 0.5, "strafe_span": 1.0, "retreat_threat": 1.0,
     "arm_r": 220.0, "arm_fight_r": 50.0, "arm_fight_r2": 90.0, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
 }
@@ -441,6 +442,12 @@ class Bot:
         rh, rhm = (P["ffa_retreat_hp"], P["ffa_retreat_hp_multi"]) if self.ffa else (P["retreat_hp"], P["retreat_hp_multi"])
         if hpf < rh or (hpf < rhm and n_threats >= 2):
             self.retreating = True
+        if P["retreat_threat"] and target is not None:
+            tf = target.get("hp", 1400) / max(1.0, target.get("max_hp", 1400))
+            finishing = tf < 0.2 and hpf > 0.2 and n_threats <= 2
+            if not finishing and ((hpf < 0.35 and tf > hpf + 0.1) or (n_threats >= 2 and hpf < 0.55)
+                                  or (n_threats >= 3 and hpf < 0.8)):
+                self.retreating = True
         if hpf > P["recover_hp"] or (not enemies and not recently_hit and hpf > 0.7):
             self.retreating = False
 
@@ -860,7 +867,7 @@ class Bot:
             pref = P["pref_gun"]
         if t > self.strafe_t:
             self.strafe = -self.strafe
-            self.strafe_t = t + 0.5 + self.rng.random() * 1.0
+            self.strafe_t = t + P["strafe_min"] + self.rng.random() * P["strafe_span"]
         ux, uy = norm2(tp[0] - p[0], tp[1] - p[1])
         lx, ly = -uy * self.strafe, ux * self.strafe
         radial = max(-1.0, min(1.0, (d - pref) / 25.0))
