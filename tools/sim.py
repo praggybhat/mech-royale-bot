@@ -32,7 +32,8 @@ HOUSE_FIRE = float(os.environ.get("HOUSE_FIRE", "0.6"))
 WAVES = os.environ.get("WAVES", "1") == "1"   # house bots engage weakest tier first
 TIER_RANK = {"easy": 0, "medium": 1, "hard": 2, "expert": 3}
 FFA = os.environ.get("SIM_FFA") == "1"
-OMNI = os.environ.get("HOUSE_OMNI") == "1"   # house bots always know where we are      # every bot for itself (qualifying / finals format)
+OMNI = os.environ.get("HOUSE_OMNI") == "1"
+SQUAD = os.environ.get("SQUAD", "1") == "1"   # calibrated practice model: 1 hunter + 1 per squad death, all late   # house bots always know where we are      # every bot for itself (qualifying / finals format)
 
 
 def wrap(a):
@@ -594,14 +595,18 @@ class Sim:
     def house_act(self, m, me):
         """House bot: shares vision of us, hunts us, strafes unpredictably, uses whatever it holds."""
         tier = m.tier
-        acc = {"easy": 0.10, "medium": 0.05, "hard": 0.025, "expert": 0.012}[tier] * HOUSE_ACC
+        acc = {"easy": 0.07, "medium": 0.045, "hard": 0.03, "expert": 0.018}[tier] * HOUSE_ACC
         lead = tier != "easy"
         a = {"tick": self.tick}
         zc, zr = self.zone_now()
         kinds = m.kinds()
         target = None
         active = True
-        if WAVES:
+        if SQUAD:
+            living = sorted((TIER_RANK[h.tier], h.id) for h in self.mechs[1:] if h.alive)
+            n_dead = sum(1 for h in self.mechs[1:] if not h.alive)
+            active = m.id in {k for _, k in living[:1 + n_dead]} or self.t > 480 * 0.72
+        elif WAVES:
             low = min((TIER_RANK[h.tier] for h in self.mechs[1:] if h.alive), default=0)
             active = TIER_RANK[tier] <= low
             # inactive bots still defend themselves when we're close
@@ -631,7 +636,7 @@ class Sim:
         goal = None
         if target is None:
             # grab a laser/lightning nearby when the slot is empty
-            if m.weapons[1] is None and tier != "easy":
+            if m.weapons[1] is None and tier != "easy" and not SQUAD:
                 best = None
                 for pk in self.pickups:
                     if pk["kind"] == "mortar":
@@ -671,6 +676,9 @@ class Sim:
             if lead:
                 tt = d / 252 + 0.05
                 c = [c[0] + target[2][0] * tt, c[1] + target[2][1] * tt, c[2]]
+            cap = {"easy": 80.0, "medium": 120.0, "hard": 170.0, "expert": 230.0}[tier]
+            if SQUAD and d > cap:
+                acc = 0.12          # calibrated: house aim falls apart past the tier's range
             yaw = math.atan2(c[1] - src[1], c[0] - src[0]) + self.rng.gauss(0, acc)
             pitch = math.atan2(c[2] - src[2], d) + self.rng.gauss(0, acc * 0.5)
             a["aim"] = [yaw, pitch]
@@ -705,7 +713,7 @@ class Sim:
         a["move"] = mv
         for pk in self.pickups:
             if math.hypot(pk["pos"][0] - m.pos[0], pk["pos"][1] - m.pos[1]) < 4 and pk["kind"] != "mortar" \
-                    and pk["kind"] not in kinds and m.weapons[1] is None and tier != "easy":
+                    and pk["kind"] not in kinds and m.weapons[1] is None and tier != "easy" and not SQUAD:
                 a["take"] = pk["id"]
                 break
         return a

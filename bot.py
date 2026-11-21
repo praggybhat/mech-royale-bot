@@ -24,12 +24,12 @@ TRACE = os.environ.get("MB_TRACE") == "1"
 # tunables (overridable via env for local A/B tests)
 P = {
     "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
-    "pref_laser": 150.0, "pref_gun": 100.0, "pref_lightning": 28.0,
+    "pref_laser": 220.0, "pref_gun": 160.0, "pref_lightning": 28.0,
     "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
     "ffa_evidence": 4.0, "ffa_deaths": 4.0, "ffa_prey_hp": 350.0, "ffa_engage_r": 70.0, "ffa_retreat_hp": 0.5,
     "ffa_retreat_hp_multi": 0.65, "ffa_explore_until": 100.0,
     "astar_budget": 0.012, "climb_max": 0.0, "loot_timeout": 20.0,
-    "heal_still_hp": 0.8, "seek_hp": 0.7, "lead_mem": 15.0, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
+    "heal_still_hp": 0.95, "seek_hp": 2.0, "lead_mem": 15.0, "hunt_hp": 2.0, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
     "latency": 0.08, "inst_lead": 0.1,
     "strafe_min": 0.5, "strafe_span": 1.0, "retreat_threat": 1.0,
     "arm_r": 220.0, "arm_fight_r": 50.0, "arm_fight_r2": 90.0, "vel_window": 1.2, "vel_blend_t": 0.8,
