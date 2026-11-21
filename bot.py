@@ -21,7 +21,7 @@ from world import World  # noqa: E402
 
 TAU = 2 * math.pi
 TRACE = os.environ.get("MB_TRACE") == "1"
-SALT = int(os.environ.get("MB_SALT", "1"))   # each submission gets its own salt: a fresh draw of our randomness
+SALT = int(os.environ.get("MB_SALT", "2"))   # each submission gets its own salt: a fresh draw of our randomness
 # tunables (overridable via env for local A/B tests)
 P = {
     "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
@@ -34,7 +34,7 @@ P = {
     "latency": 0.08, "inst_lead": 0.1,
     "strafe_min": 0.5, "strafe_span": 1.0, "retreat_threat": 1.0,
     "farm_crate_r": 70.0, "farm_npc_r": 75.0, "farm_crate_hp": 0.45, "farm_npc_hp": 0.5,
-    "heal_cover": 0.0,
+    "heal_cover": 0.0, "kite_lat": 0.85, "kite_boost_frac": 0.5, "kite_boost_e": 40.0,
     "dodge_window": 0.7, "dodge_miss": 4.0, "dodge_urg": 0.0,
     "arm_r": 220.0, "arm_fight_r": 50.0, "arm_fight_r2": 90.0, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
@@ -904,10 +904,13 @@ class Bot:
         ux, uy = norm2(tp[0] - p[0], tp[1] - p[1])
         lx, ly = -uy * self.strafe, ux * self.strafe
         radial = max(-1.0, min(1.0, (d - pref) / 25.0))
-        mx = lx * 0.85 + ux * radial
-        my = ly * 0.85 + uy * radial
+        lat = 0.85
+        if radial < 0 and pref > 50:
+            lat = P["kite_lat"]          # inside our range: back away hard, strafe lightly
+        mx = lx * lat + ux * radial
+        my = ly * lat + uy * radial
         boost = False
-        if d < pref * 0.5 and me["energy"] > 40 and pref > 50:
+        if d < pref * P["kite_boost_frac"] and me["energy"] > P["kite_boost_e"] and pref > 50:
             boost = True
         return norm2(mx, my), boost
 
