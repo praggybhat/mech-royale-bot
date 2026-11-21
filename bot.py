@@ -22,14 +22,16 @@ from world import World  # noqa: E402
 TAU = 2 * math.pi
 # tunables (overridable via env for local A/B tests)
 P = {
-    "retreat_hp": 0.40, "retreat_hp_multi": 0.55, "recover_hp": 0.85,
-    "pref_laser": 110.0, "pref_gun": 65.0, "pref_lightning": 28.0,
-    "cube_fight_r": 30.0,
+    "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
+    "pref_laser": 150.0, "pref_gun": 100.0, "pref_lightning": 28.0,
+    "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
+    "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
 }
 for _k in list(P):
     if os.environ.get("MB_" + _k.upper()):
         P[_k] = float(os.environ["MB_" + _k.upper()])
 WEAPON_VALUE = {"laser": 4.0, "lightning": 3.0, "gun": 2.0, "mortar": 1.0}
+WEAPON_VALUE.update(laser=P["v_laser"], lightning=P["v_lightning"], gun=P["v_gun"])
 UPGRADE_PRIORITY = [
     "armor", "plating", "nanites", "laser_damage", "laser_charge", "lightning_efficiency",
     "gun_damage", "gun_rate", "servos", "lightning_range", "gun_mag", "gun_velocity",
@@ -269,7 +271,7 @@ class Bot:
         def score_enemy(m):
             d = hyp(p, m["pos"])
             hp = m.get("hp", 1400)
-            s = d + hp * 0.04
+            s = d * P["dist_w"] + hp * P["hp_w"]
             if m["id"] in self.threat_ids and t - self.threat_ids[m["id"]] < 3:
                 s -= 40
             if m["id"] == self.target_id:
@@ -418,6 +420,11 @@ class Bot:
                 cb = min(near_cubes, key=lambda c: hyp(p, c["pos"]))
                 move = norm2(cb["pos"][0] - p[0], cb["pos"][1] - p[1])
                 mode = "fight:cube"
+            elif loot_goal is not None and loot_goal[2] == "weapon" and hyp(p, loot_goal[1]) < P["weapon_fight_r"] \
+                    and hyp(p, target["pos"]) > 20:
+                # a better weapon close by is worth a detour even under fire
+                move = self.nav(me, loot_goal[1], t, urgent=True)
+                mode = "fight:weapon"
             aim_point = self.center_of(target)
             aim_vel = target["vel"]
         else:
