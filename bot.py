@@ -20,6 +20,7 @@ import mechfight as mf  # noqa: E402
 from world import World  # noqa: E402
 
 TAU = 2 * math.pi
+TRACE = os.environ.get("MB_TRACE") == "1"
 # tunables (overridable via env for local A/B tests)
 P = {
     "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
@@ -29,7 +30,8 @@ P = {
     "ffa_retreat_hp_multi": 0.65, "ffa_explore_until": 100.0,
     "astar_budget": 0.012, "climb_max": 0.0, "loot_timeout": 20.0,
     "heal_still_hp": 0.8, "seek_hp": 0.7, "lead_mem": 15.0, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
-    "latency": 0.08, "vel_window": 1.2, "vel_blend_t": 0.8,
+    "latency": 0.08, "inst_lead": 0.1,
+    "arm_r": 220.0, "arm_fight_r": 50.0, "arm_fight_r2": 90.0, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
 }
 for _k in list(P):
@@ -534,6 +536,24 @@ class Bot:
                 drop_goal = dr
                 break
 
+        # laser/lightning first: a power weapon decides duels (house bots grab lasers early)
+        arm_goal = None
+        if P["arm_r"] > 0 and "laser" not in kinds and "lightning" not in kinds:
+            best = None
+            for pk in self.mem_pk.values():
+                if pk["kind"] not in ("laser", "lightning"):
+                    continue
+                if self.blocked_pickups.get(pk["id"], -1) > t - 5 or self.is_unreachable(pk["pos"], t):
+                    continue
+                if pk["pos"][2] - self.W.ground(pk["pos"][0], pk["pos"][1]) > 3 and abs(pk["pos"][2] - p[2]) > 2.5:
+                    continue
+                d = hyp(p, pk["pos"])
+                if d < P["arm_r"] and self.safe_inside(pk["pos"], z, t, margin=5, horizon=d / speed + 5):
+                    if best is None or d < best[0]:
+                        best = (d, pk)
+            if best is not None:
+                arm_goal = best[1]
+
         # shootables when idle
         shoot_obj = None
         if target is None and not recently_hit:
@@ -554,6 +574,13 @@ class Bot:
                     shoot_obj = (o, k, cpt)
                     break
 
+        if arm_goal is not None and mode in ("fight", "hold", "avoid"):
+            close = target is not None and (hyp(p, target["pos"]) < P["arm_fight_r"] or
+                                            (target["id"] in self.threat_ids and t - self.threat_ids[target["id"]] < 3
+                                             and hyp(p, target["pos"]) < P["arm_fight_r2"]))
+            if not close:
+                mode = "arm"
+
         # ---------------- movement decision
         aim_point = None
         aim_vel = [0.0, 0.0, 0.0]
@@ -565,6 +592,12 @@ class Bot:
         elif mode == "retreat":
             move, boost = self.retreat_move(me, enemies, z, t, hpf)
             if target is not None:
+                aim_point = self.center_of(target)
+                aim_vel = self.smooth_vel(target, hyp(p, target["pos"]) / 252.0)
+        elif mode == "arm":
+            move = self.nav(me, arm_goal["pos"], t, urgent=True)
+            self.loot_commit = arm_goal["id"]
+            if target is not None:      # keep shooting while we walk
                 aim_point = self.center_of(target)
                 aim_vel = self.smooth_vel(target, hyp(p, target["pos"]) / 252.0)
         elif mode == "avoid":
@@ -664,6 +697,12 @@ class Bot:
             if mode == "avoid":
                 fire = [False, False]  # don't reveal ourselves to a fight we're not in
             act["aim"] = aim
+            if TRACE and target is not None:
+                d_ = hyp(p, target["pos"])
+                mf.log(f"T t={t:.1f} mode={mode} tgt={target['id']} d={d_:.0f} hp={target.get('hp', 0):.0f} "
+                       f"aimerr={abs(wrap(me['aim'][0] - aim[0])):.3f} fire={fire} w={list(kinds)} "
+                       f"ammo={weapons[0].get('ammo') if weapons[0] else None} "
+                       f"rl={weapons[0].get('reload') if weapons[0] else None} los={self.W.los(muzzle, aim_point)}")
         else:
             act["aim"] = self.scan_aim(me, t, move)
             # keep a charged laser from wasting; release does nothing harmful
@@ -1008,36 +1047,44 @@ class Bot:
         tol = math.atan2(radius * 0.8, max(dist, 1.0)) + 0.004
         desired = None
         los = self.W.los(muzzle, aim_point)
-        # gun lead
-        aim = self.aim_to(muzzle, aim_point)
+        # instant weapons (laser, lightning) aim straight at the target one decision ahead;
+        # the gun leads. Pick the aim for the weapon that matters this tick, then let each
+        # weapon fire only when ITS own solution is aligned.
+        inst_pt = [aim_point[0] + aim_vel[0] * P["inst_lead"], aim_point[1] + aim_vel[1] * P["inst_lead"],
+                   aim_point[2]]
+        inst = self.aim_to(muzzle, inst_pt)
+        gun_aim = None
         if "gun" in kinds:
             g = weapons[kinds["gun"]]
             lp = self.lead(muzzle, aim_point, aim_vel, g["stats"]["speed"])
-            aim = self.aim_to(muzzle, lp)
-            desired = aim
-            err = abs(wrap(actual[0] - aim[0])) + abs(actual[1] - aim[1])
+            gun_aim = self.aim_to(muzzle, lp)
+        laser_hot = False
+        if "laser" in kinds:
+            L = weapons[kinds["laser"]]
+            laser_hot = (L.get("charge", 0) > 0 or L["cooldown"] < 0.2) and dist < L["stats"]["range"] * 0.97
+        light_close = "lightning" in kinds and dist < weapons[kinds["lightning"]]["stats"]["range"] * 1.1
+        if laser_hot or light_close or gun_aim is None:
+            aim = inst
+        else:
+            aim = gun_aim
+        if gun_aim is not None:
+            g = weapons[kinds["gun"]]
+            err = abs(wrap(actual[0] - gun_aim[0])) + abs(actual[1] - gun_aim[1])
             if g.get("reload", 0) <= 0 and g.get("ammo", 1) > 0 and dist < g["stats"]["range"] * 0.95 \
-                    and err < tol * 1.3 and self.W.los(muzzle, lp):
+                    and err < tol * 1.3 and los:
                 fire[kinds["gun"]] = True
-            if g.get("ammo", 1) == 0 and g.get("reload", 0) <= 0:
-                pass
         if "laser" in kinds:
             L = weapons[kinds["laser"]]
             st = L["stats"]
-            la = self.aim_to(muzzle, [aim_point[0] + aim_vel[0] * 0.05, aim_point[1] + aim_vel[1] * 0.05,
-                                      aim_point[2]])
-            if desired is None or dist > 50:
-                aim = la
-                desired = la
             charge = L.get("charge", 0)
             full = st["charge"]
-            err = abs(wrap(actual[0] - la[0])) + abs(actual[1] - la[1])
+            err = abs(wrap(actual[0] - inst[0])) + abs(actual[1] - inst[1])
             in_range = dist < st["range"] * 0.97
             if charge > 0:
-                # keep holding until full and on target; release when good
+                # hold until full and aligned, then release; never let hold_s auto-fire it blind
                 if charge >= full * 0.97 and err < tol and los and in_range:
                     fire[kinds["laser"]] = False
-                elif charge >= full + st.get("hold_s", 2) - 0.25:
+                elif charge >= full + st.get("hold_s", 2) - 0.3 and err < tol * 3:
                     fire[kinds["laser"]] = False
                 else:
                     fire[kinds["laser"]] = True
@@ -1050,10 +1097,6 @@ class Bot:
             if dist < st["range"] * 0.95 and yaw_err < math.radians(st["cone_deg"]) * 0.45 and los \
                     and me["energy"] > st["energy"] + 4 and Lg["cooldown"] <= 0.05:
                 fire[kinds["lightning"]] = True
-            if dist < st["range"] and (desired is None or dist < 40):
-                aim = self.aim_to(muzzle, aim_point)
-                if "gun" in kinds:
-                    aim = desired
         if "mortar" in kinds:
             M = weapons[kinds["mortar"]]
             st = M["stats"]

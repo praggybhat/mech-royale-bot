@@ -19,6 +19,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+if os.environ.get("BOT_PATH"):
+    sys.path.insert(0, os.environ["BOT_PATH"])
 
 import mechfight as mf  # noqa: E402
 import bot as botmod  # noqa: E402
@@ -29,7 +31,8 @@ HOUSE_ACC = float(os.environ.get("HOUSE_ACC", "1.0"))
 HOUSE_FIRE = float(os.environ.get("HOUSE_FIRE", "0.6"))
 WAVES = os.environ.get("WAVES", "1") == "1"   # house bots engage weakest tier first
 TIER_RANK = {"easy": 0, "medium": 1, "hard": 2, "expert": 3}
-FFA = os.environ.get("SIM_FFA") == "1"      # every bot for itself (qualifying / finals format)
+FFA = os.environ.get("SIM_FFA") == "1"
+OMNI = os.environ.get("HOUSE_OMNI") == "1"   # house bots always know where we are      # every bot for itself (qualifying / finals format)
 
 
 def wrap(a):
@@ -605,6 +608,9 @@ class Sim:
             if not active and me.alive and math.hypot(me.pos[0] - m.pos[0], me.pos[1] - m.pos[1]) < 60 \
                     and self.sees(m, me):
                 active = True
+        if OMNI and me.alive and not FFA:
+            self.house_known = (self.t if self.sees(m, me) else self.house_known[0] if self.house_known else -99,
+                                me.pos[:], me.vel[:])
         if FFA:
             active = False
             if not hasattr(m, "ffa_t") or self.t - m.ffa_t > 0.5:
@@ -635,7 +641,8 @@ class Sim:
                         best = (d, pk)
                 if best:
                     goal = best[1]["pos"]
-            if goal is None and active and me.alive and self.house_known and self.t - self.house_known[0] < 30:
+            if goal is None and active and me.alive and self.house_known and \
+                    (OMNI or self.t - self.house_known[0] < 30):
                 goal = self.house_known[1]
             if goal is None and math.hypot(m.pos[0] - self.znc[0], m.pos[1] - self.znc[1]) > self.znr * 0.5:
                 goal = self.znc
