@@ -29,6 +29,7 @@ HOUSE_ACC = float(os.environ.get("HOUSE_ACC", "1.0"))
 HOUSE_FIRE = float(os.environ.get("HOUSE_FIRE", "0.6"))
 WAVES = os.environ.get("WAVES", "1") == "1"   # house bots engage weakest tier first
 TIER_RANK = {"easy": 0, "medium": 1, "hard": 2, "expert": 3}
+FFA = os.environ.get("SIM_FFA") == "1"      # every bot for itself (qualifying / finals format)
 
 
 def wrap(a):
@@ -545,13 +546,28 @@ class Sim:
         target = None
         active = True
         if WAVES:
-            low = min(TIER_RANK[h.tier] for h in self.mechs[1:] if h.alive)
+            low = min((TIER_RANK[h.tier] for h in self.mechs[1:] if h.alive), default=0)
             active = TIER_RANK[tier] <= low
             # inactive bots still defend themselves when we're close
             if not active and me.alive and math.hypot(me.pos[0] - m.pos[0], me.pos[1] - m.pos[1]) < 60 \
                     and self.sees(m, me):
                 active = True
-        if active and me.alive and self.house_known and self.t - self.house_known[0] < 1.0:
+        if FFA:
+            active = False
+            if not hasattr(m, "ffa_t") or self.t - m.ffa_t > 0.5:
+                m.ffa_t = self.t
+                best = None
+                for e in self.mechs:
+                    if e is m or not e.alive:
+                        continue
+                    d = math.hypot(e.pos[0] - m.pos[0], e.pos[1] - m.pos[1])
+                    if d < 200 and (best is None or d < best[0]) and self.sees(m, e):
+                        best = (d, e)
+                m.ffa_tgt = best[1] if best else None
+            e = getattr(m, "ffa_tgt", None)
+            if e is not None and e.alive:
+                target = (self.t, e.pos[:], e.vel[:])
+        elif active and me.alive and self.house_known and self.t - self.house_known[0] < 1.0:
             target = self.house_known
         goal = None
         if target is None:
@@ -689,7 +705,7 @@ class Sim:
             if not me.alive or len(alive) <= 1:
                 break
             # shared house vision of us
-            for h in alive[1:]:
+            for h in ([] if FFA else alive[1:]):
                 if self.sees(h, me):
                     self.house_known = (self.t, me.pos[:], me.vel[:])
                     break
@@ -711,7 +727,7 @@ class Sim:
         place = alive_n + (0 if me.alive else 1) if not me.alive else 1 if alive_n == 1 else alive_n
         if me.alive and alive_n > 1:
             place = 1 + sum(1 for m in self.mechs[1:] if m.alive and m.hp > me.hp)
-        return {"place": place, "kills": me.kills, "t": round(self.t, 1), "cubes": me.cubes,
+        return {"ffa": getattr(mybot, "ffa", None), "place": place, "kills": me.kills, "t": round(self.t, 1), "cubes": me.cubes,
                 "weapons": me.kinds(), "max_ms": round(max(times) * 1000, 1) if times else 0,
                 "stat": {k: round(v) for k, v in sorted(self.stat.items())}}
 

@@ -25,6 +25,8 @@ P = {
     "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
     "pref_laser": 150.0, "pref_gun": 100.0, "pref_lightning": 28.0,
     "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
+    "ffa_evidence": 4.0, "ffa_prey_hp": 350.0, "ffa_engage_r": 70.0, "ffa_retreat_hp": 0.5,
+    "ffa_retreat_hp_multi": 0.65, "ffa_explore_until": 100.0,
     "heal_still_hp": 0.8, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
     "latency": 0.08, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
@@ -98,6 +100,10 @@ class Bot:
         self.target_id = None
         self.charge_hold = 0.0
         self.vhist = {}
+        self.ffa = os.environ.get("MB_FORCE_FFA") == "1"
+        self.ffa_evidence = 0.0
+        self.prev_hp = {}
+        self.ffa_victims = set()
         self.explore = None
         self.explore_until = -1.0
 
@@ -283,6 +289,7 @@ class Bot:
                 h.pop(0)
         for k in [k for k, v in self.last_seen.items() if t - v[0] > 12]:
             del self.last_seen[k]
+        self.update_ffa(obs, enemies, npcs, me, t)
         for s in obs["sounds"]:
             if s["kind"] in ("gun", "laser", "lightning", "mortar", "laser_charge", "step", "boost", "jet") \
                     and s["dist"] in ("near", "mid"):
@@ -315,7 +322,8 @@ class Bot:
 
         # ---------------- retreat hysteresis
         n_threats = len(near_enemies)
-        if hpf < P["retreat_hp"] or (hpf < P["retreat_hp_multi"] and n_threats >= 2):
+        rh, rhm = (P["ffa_retreat_hp"], P["ffa_retreat_hp_multi"]) if self.ffa else (P["retreat_hp"], P["retreat_hp_multi"])
+        if hpf < rh or (hpf < rhm and n_threats >= 2):
             self.retreating = True
         if hpf > P["recover_hp"] or (not enemies and not recently_hit and hpf > 0.7):
             self.retreating = False
@@ -348,13 +356,19 @@ class Bot:
             mode = "retreat"
         if goal is None and mode != "retreat" and target is not None:
             mode = "fight"
+            if self.ffa:
+                attacking = target["id"] in self.threat_ids and t - self.threat_ids[target["id"]] < 6
+                dt_ = hyp(p, target["pos"])
+                weak = target.get("hp", 1400) < P["ffa_prey_hp"] and dt_ < 120
+                if not attacking and not weak and dt_ > P["ffa_engage_r"]:
+                    mode = "avoid"
 
         # ---------------- loot planning (only when nothing better)
         loot_goal = None
         take_id = None
         drop_slot = None
-        loadout_val = sorted([WEAPON_VALUE[w["kind"]] for w in weapons if w] + [0.0] * 2)
-        weakest = loadout_val[0]
+        # value of the slot a pickup would replace: an empty slot is free, else our worst weapon
+        weakest = 0.0 if None in weapons else min(WEAPON_VALUE[w["kind"]] for w in weapons if w)
         for pk in obs["pickups"]:
             if pk["kind"] in kinds or pk["id"] in self.blocked_pickups and t - self.blocked_pickups[pk["id"]] < 5:
                 continue
@@ -433,6 +447,12 @@ class Bot:
             if target is not None:
                 aim_point = self.center_of(target)
                 aim_vel = self.smooth_vel(target, hyp(p, target["pos"]) / 252.0)
+        elif mode == "avoid":
+            # free-for-all: stay out of a healthy stranger's fight; keep watching it
+            move, boost = self.retreat_move(me, enemies, z, t, hpf)
+            boost = False
+            aim_point = self.center_of(target)
+            aim_vel = self.smooth_vel(target, hyp(p, target["pos"]) / 252.0)
         elif mode == "fight":
             move, boost = self.fight_move(me, target, kinds, weapons, z, t, hpf)
             # grab nearby cubes mid-fight (+HP, +damage) while still shooting
@@ -507,6 +527,8 @@ class Bot:
         fire = [False, False]
         if aim_point is not None:
             aim, fire = self.weapons_logic(me, weapons, kinds, aim_point, aim_vel, target, muzzle, t, obs)
+            if mode == "avoid":
+                fire = [False, False]  # don't reveal ourselves to a fight we're not in
             act["aim"] = aim
         else:
             act["aim"] = self.scan_aim(me, t, move)
@@ -529,6 +551,49 @@ class Bot:
         mf.draw.label(f"{mode} hp{me['hp']:.0f} e{me['energy']:.0f} {(time.perf_counter() - t0) * 1000:.0f}ms")
         return act
 
+    # ------------------------------------------------------------------ match type
+    def update_ffa(self, obs, enemies, npcs, me, t):
+        """Practice house bots never fight each other. Seeing mech-on-mech damage means a free-for-all.
+
+        Guard against splash/chain side effects of fire aimed at us: only a beam's FIRST target counts,
+        and HP drops are ignored while lightning arcs or mortar shells are around."""
+        if self.ffa:
+            return
+        victims = self.ffa_victims
+        mine = {e.get("target") for e in obs["events"] if e["type"] == "hit"}
+        splashy = any(b.get("kind") == "lightning" for b in obs.get("beams", [])) or \
+            any(pr["kind"] == "mortar" for pr in obs["projectiles"])
+        for b in obs.get("beams", []):
+            by = b.get("by")
+            path = b.get("path") or []
+            if by is None or by == me["id"] or by >= 16 or len(path) < 2:
+                continue
+            first = path[1]
+            if math.dist(first, [me["pos"][0], me["pos"][1], me["pos"][2] + 4.5]) < 8:
+                continue
+            for m in enemies:
+                if m["id"] != by and math.dist(first, self.center_of(m)) < 5:
+                    self.ffa_evidence += 2
+                    victims.add(m["id"])
+        zc, zr = self.zone_now(obs["zone"], t)
+        for m in enemies:
+            hp = m.get("hp")
+            if hp is None:
+                continue
+            prev = self.prev_hp.get(m["id"])
+            self.prev_hp[m["id"]] = (hp, t)
+            if prev is None or t - prev[1] > 0.25 or hp > prev[0] - 30 or m["id"] in mine or splashy:
+                continue
+            if hyp(m["pos"], zc) > zr - 3:
+                continue
+            if any(hyp(n["pos"], m["pos"]) < 70 for n in npcs):
+                continue
+            self.ffa_evidence += 1
+            victims.add(m["id"])
+        if self.ffa_evidence >= P["ffa_evidence"] and len(victims) >= 2:
+            self.ffa = True
+            mf.log(f"t={t:.1f} free-for-all detected")
+
     # ------------------------------------------------------------------ behaviors
     def pick_prey(self, p, t, z, hpf):
         """Last known position of a recently seen enemy worth chasing, or None."""
@@ -545,6 +610,8 @@ class Bot:
                 continue
             if not self.safe_inside(q, z, t, margin=8, horizon=d / 11.7 + 5):
                 continue
+            if self.ffa and hp > P["ffa_prey_hp"]:
+                continue
             s = d + hp * 0.1 + age * 15
             if s < bs:
                 bs, best = s, q
@@ -552,7 +619,7 @@ class Bot:
 
     def explore_goal(self, p, z, t):
         """Wander inside the next circle to find crates, drones and loot."""
-        if t > P["explore_until"]:
+        if t > (P["ffa_explore_until"] if self.ffa else P["explore_until"]):
             return None
         if self.explore is not None and hyp(p, self.explore) > 6 and t < self.explore_until:
             return self.explore
