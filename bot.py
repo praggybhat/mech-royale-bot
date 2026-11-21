@@ -25,7 +25,7 @@ P = {
     "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
     "pref_laser": 150.0, "pref_gun": 100.0, "pref_lightning": 28.0,
     "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
-    "ffa_evidence": 4.0, "ffa_prey_hp": 350.0, "ffa_engage_r": 70.0, "ffa_retreat_hp": 0.5,
+    "ffa_evidence": 4.0, "ffa_deaths": 2.0, "ffa_prey_hp": 350.0, "ffa_engage_r": 70.0, "ffa_retreat_hp": 0.5,
     "ffa_retreat_hp_multi": 0.65, "ffa_explore_until": 100.0,
     "astar_budget": 0.02, "loot_timeout": 20.0,
     "heal_still_hp": 0.8, "seek_hp": 0.7, "lead_mem": 15.0, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
@@ -105,6 +105,8 @@ class Bot:
         self.ffa_evidence = 0.0
         self.prev_hp = {}
         self.ffa_victims = set()
+        self.my_kills = 0
+        self.n_mechs = int(self.cfg["match"].get("mechs", 16))
         self.mem_pk = {}      # id -> pickup dict   (items don't move: remember them across glances)
         self.mem_cube = {}    # id -> cube dict
         self.mem_crate = {}   # id -> crate dict
@@ -277,6 +279,8 @@ class Bot:
                     self.threat_ids[e["by"]] = t
             elif ty == "hit":
                 self.last_deal_t = t
+            elif ty == "kill":
+                self.my_kills += 1
             elif ty == "take_failed":
                 self.blocked_pickups[e["id"]] = t
                 if e.get("reason") == "gone":
@@ -625,46 +629,31 @@ class Bot:
 
     # ------------------------------------------------------------------ match type
     def update_ffa(self, obs, enemies, npcs, me, t):
-        """Practice house bots never fight each other. Seeing mech-on-mech damage means a free-for-all.
-
-        Guard against splash/chain side effects of fire aimed at us: only a beam's FIRST target counts,
-        and HP drops are ignored while lightning arcs or mortar shells are around."""
+        """Practice house bots never fight each other, so they only die to us (or, late, to the zone).
+        Mechs dying that we did not kill while the zone is still gentle means a free-for-all."""
         if self.ffa:
             return
-        victims = self.ffa_victims
-        mine = {e.get("target") for e in obs["events"] if e["type"] == "hit"}
-        splashy = any(b.get("kind") == "lightning" for b in obs.get("beams", [])) or \
-            any(pr["kind"] == "mortar" for pr in obs["projectiles"])
+        others_dead = (self.n_mechs - obs["alive"]) - self.my_kills
+        if others_dead >= P["ffa_deaths"] and obs["zone"].get("dps", 0) <= 35:
+            self.ffa = True
+            mf.log(f"t={t:.1f} free-for-all detected ({others_dead} deaths we did not cause)")
+            return
+        # a laser beam whose first contact is another mech, fired by a mech aiming at it
         for b in obs.get("beams", []):
             by = b.get("by")
             path = b.get("path") or []
-            if by is None or by == me["id"] or by >= 16 or len(path) < 2:
+            if b.get("kind") != "laser" or by is None or by == me["id"] or by >= 16 or len(path) < 2:
                 continue
             first = path[1]
-            if math.dist(first, [me["pos"][0], me["pos"][1], me["pos"][2] + 4.5]) < 8:
+            if math.dist(first, [me["pos"][0], me["pos"][1], me["pos"][2] + 4.5]) < 10:
                 continue
             for m in enemies:
-                if m["id"] != by and math.dist(first, self.center_of(m)) < 5:
-                    self.ffa_evidence += 2
-                    victims.add(m["id"])
-        zc, zr = self.zone_now(obs["zone"], t)
-        for m in enemies:
-            hp = m.get("hp")
-            if hp is None:
-                continue
-            prev = self.prev_hp.get(m["id"])
-            self.prev_hp[m["id"]] = (hp, t)
-            if prev is None or t - prev[1] > 0.25 or hp > prev[0] - 30 or m["id"] in mine or splashy:
-                continue
-            if hyp(m["pos"], zc) > zr - 3:
-                continue
-            if any(hyp(n["pos"], m["pos"]) < 70 for n in npcs):
-                continue
-            self.ffa_evidence += 1
-            victims.add(m["id"])
-        if self.ffa_evidence >= P["ffa_evidence"] and len(victims) >= 2:
+                if m["id"] != by and math.dist(first, self.center_of(m)) < 4:
+                    self.ffa_evidence += 1
+                    self.ffa_victims.add(m["id"])
+        if self.ffa_evidence >= P["ffa_evidence"] and len(self.ffa_victims) >= 2:
             self.ffa = True
-            mf.log(f"t={t:.1f} free-for-all detected")
+            mf.log(f"t={t:.1f} free-for-all detected (laser fights)")
 
     # ------------------------------------------------------------------ behaviors
     def pick_prey(self, p, t, z, hpf):
