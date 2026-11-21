@@ -21,7 +21,7 @@ from world import World  # noqa: E402
 
 TAU = 2 * math.pi
 TRACE = os.environ.get("MB_TRACE") == "1"
-SALT = int(os.environ.get("MB_SALT", "2"))   # each submission gets its own salt: a fresh draw of our randomness
+SALT = int(os.environ.get("MB_SALT", "3"))   # each submission gets its own salt: a fresh draw of our randomness
 # tunables (overridable via env for local A/B tests)
 P = {
     "retreat_hp": 0.25, "retreat_hp_multi": 0.30, "recover_hp": 0.85,
@@ -34,7 +34,7 @@ P = {
     "latency": 0.08, "inst_lead": 0.1,
     "strafe_min": 0.5, "strafe_span": 1.0, "retreat_threat": 1.0,
     "farm_crate_r": 70.0, "farm_npc_r": 75.0, "farm_crate_hp": 0.45, "farm_npc_hp": 0.5,
-    "heal_cover": 0.0, "kite_lat": 0.85, "kite_boost_frac": 0.5, "kite_boost_e": 40.0,
+    "heal_cover": 0.0, "kite_lat": 0.35, "kite_boost_frac": 0.5, "kite_boost_e": 40.0,
     "dodge_window": 0.7, "dodge_miss": 4.0, "dodge_urg": 0.0,
     "arm_r": 220.0, "arm_fight_r": 50.0, "arm_fight_r2": 90.0, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
