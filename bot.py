@@ -33,6 +33,8 @@ P = {
     "latency": 0.08, "inst_lead": 0.1,
     "strafe_min": 0.5, "strafe_span": 1.0, "retreat_threat": 1.0,
     "farm_crate_r": 70.0, "farm_npc_r": 75.0, "farm_crate_hp": 0.45, "farm_npc_hp": 0.5,
+    "heal_cover": 1.0,
+    "dodge_window": 0.9, "dodge_miss": 3.6, "dodge_urg": 0.8,
     "arm_r": 220.0, "arm_fight_r": 50.0, "arm_fight_r2": 90.0, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
 }
@@ -294,6 +296,7 @@ class Bot:
         if want == (0.0, 0.0):
             return want
         base = math.atan2(want[1], want[0])
+        mag = min(1.0, math.hypot(want[0], want[1]))
         for off in (0, 0.5, -0.5, 1.0, -1.0, 1.6, -1.6, 2.3, -2.3, math.pi):
             a = base + off
             q = (p[0] + math.cos(a) * probe, p[1] + math.sin(a) * probe)
@@ -304,7 +307,7 @@ class Bot:
             if zone is not None and not self.safe_inside(q, zone, t, margin=3.0, horizon=2.0) \
                     and self.safe_inside(p, zone, t, margin=3.0, horizon=2.0):
                 continue
-            return math.cos(a), math.sin(a)
+            return math.cos(a) * mag, math.sin(a) * mag
         return want
 
     # ------------------------------------------------------------------ aiming
@@ -680,6 +683,18 @@ class Bot:
                 move = self.nav(me, prey, t)
             elif hpf < P["heal_still_hp"] and t - self.last_hit_t < 30 and self.safe_inside(p, z, t, 10, 15):
                 mode = "heal"  # stand still: silent, regenerating
+                if P["heal_cover"]:
+                    last = max(self.last_seen.values(), key=lambda v: v[0], default=None)
+                    if last is not None and t - last[0] < 20:
+                        lp = last[1]
+                        if self.W.los([lp[0], lp[1], lp[2] + 8], [p[0], p[1], p[2] + 6], step=2.5):
+                            if self.cover is None or t - self.cover_t > 2.0:
+                                self.cover = self.find_cover(me, [lp], z, t)
+                                self.cover_t = t
+                            if self.cover is not None and hyp(p, self.cover) > 2.0:
+                                mv = self.nav(me, self.cover, t)
+                                move = (mv[0] * 0.4, mv[1] * 0.4)   # creep: below step-sound speed
+                                mode = "heal:cover"
             elif not self.ffa and hpf >= P["seek_hp"] and (lead := self.pick_lead(p, z, t)) is not None:
                 mode = "seek"  # go toward what we heard: house bots only count if we kill them
                 move = self.nav(me, lead, t)
@@ -995,17 +1010,19 @@ class Bot:
             if vv < 1:
                 continue
             ts = (rx * v[0] + ry * v[1] + rz * v[2]) / vv
-            if ts <= 0 or ts > 0.7:
+            if ts <= 0 or ts > P["dodge_window"]:
                 continue
             mx, my = rx - v[0] * ts, ry - v[1] * ts
             miss = math.hypot(mx, my)
-            if miss < 4.0:
-                dx, dy = norm2(mx, my)
-                if dx == 0 and dy == 0:
-                    dx, dy = norm2(-v[1], v[0])
-                urg = 0.5 * (1 - miss / 4.0) + 0.2
+            if miss < P["dodge_miss"]:
+                # step perpendicular to the bullet path, away from its closest point
+                hv = math.hypot(v[0], v[1]) or 1.0
+                nx, ny = -v[1] / hv, v[0] / hv
+                if nx * mx + ny * my < 0:
+                    nx, ny = -nx, -ny
+                urg = P["dodge_urg"] if P["dodge_urg"] > 0 else 0.5 * (1 - miss / P["dodge_miss"]) + 0.2
                 if best is None or urg > best[2]:
-                    best = (dx, dy, urg)
+                    best = (nx, ny, urg)
         # laser telegraph: an enemy charging with aim on us -> sidestep hard
         for m in enemies:
             if m.get("charging"):
