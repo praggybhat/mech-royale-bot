@@ -106,13 +106,13 @@ class Sim:
             x, y = pts[i]
             self.mechs.append(Mech(i, [x, y, W.surface(x, y)], cfg, None if i == 0 else tiers[i - 1]))
         for _ in range(cfg["loot"]["floor_count"]):
-            x, y = self.rand_walk(margin=20)
+            x, y = self.rand_roof() if self.rng.random() < 0.25 else self.rand_walk(margin=20)
             k = self.rng.choice(["mortar", "laser", "lightning"])
             self.pickups.append({"id": self.next_id, "kind": k, "pos": [x, y, W.surface(x, y)]})
             self.next_id += 1
         self.objs = []
         for k in range(cfg["crates"]["count"]):
-            x, y = self.rand_walk(margin=20)
+            x, y = self.rand_roof() if self.rng.random() < 0.25 else self.rand_walk(margin=20)
             self.objs.append(Obj(1000 + k, "crate", [x, y, W.surface(x, y)], cfg["crates"]["hp"], 1.4, 2.4))
         for k in range(cfg["npc"]["count"]):
             x, y = self.rand_walk(margin=30)
@@ -124,6 +124,15 @@ class Sim:
         self.house_known = None  # shared vision: (t, pos, vel)
         self.stat = {}
         self.sounds0 = []  # sounds heard by our bot (mech 0) since its last observation
+
+    def rand_roof(self):
+        W = self.W
+        while True:
+            x = self.rng.uniform(W.minx + 40, W.maxx - 40)
+            y = self.rng.uniform(W.miny + 40, W.maxy - 40)
+            c = W.cell(x, y)
+            if W.isprism[c] and 4 < W.surf[c] - W.gnd[c] < 40:
+                return x, y
 
     def rand_walk(self, margin):
         W = self.W
@@ -304,24 +313,52 @@ class Sim:
             dvx, dvy = dvx / dl * acc, dvy / dl * acc
         m.vel[0] += dvx
         m.vel[1] += dvy
-        # move with sliding
+        # vertical: jump, jets, gravity (feet must clear a ledge to move over it)
         W = self.W
+        if not hasattr(m, "vz"):
+            m.vz, m.grounded = 0.0, True
+        if a.get("jump") and m.grounded:
+            m.vz = M["jump_speed"]
+            m.grounded = False
+        if a.get("boost") and not m.grounded and m.energy > 1:
+            m.vz = min(M["max_rise_speed"], m.vz + M["jet_accel"] * DT)
+            m.energy -= M["jet_drain"] * DT
+            m.spent_t = self.t
+        # horizontal move with sliding
+        moved = False
         for vx, vy in ((m.vel[0], m.vel[1]), (m.vel[0], 0.0), (0.0, m.vel[1])):
             nxp, nyp = m.pos[0] + vx * DT, m.pos[1] + vy * DT
             c0 = W.cell(m.pos[0], m.pos[1])
             c1 = W.cell(nxp, nyp)
             if not W.in_bounds(nxp, nyp, 3):
                 continue
-            ok = c1 == c0 or W.walk[c1] or W.surf[c1] <= W.surf[c0] - 0.5
-            diag = 1.414 if (c1 % W.nx != c0 % W.nx and c1 // W.nx != c0 // W.nx) else 1.0
-            if ok and W.surf[c1] - W.surf[c0] <= (1.2 if (W.isprism[c0] or W.isprism[c1]) else W.slope_rise * diag):
+            if c1 == c0:
+                ok = True
+            elif m.grounded:
+                diag = 1.414 if (c1 % W.nx != c0 % W.nx and c1 // W.nx != c0 // W.nx) else 1.0
+                lim = 1.2 if (W.isprism[c0] or W.isprism[c1]) else W.slope_rise * diag
+                ok = (W.walk[c1] or W.surf[c1] <= W.surf[c0] - 0.5) and W.surf[c1] - W.surf[c0] <= lim
+            else:
+                ok = W.surf[c1] <= m.pos[2] + 0.3
+            if ok:
                 m.pos[0], m.pos[1] = nxp, nyp
-                m.pos[2] = W.surf[c1]
                 if (vx, vy) != (m.vel[0], m.vel[1]):
                     m.vel[0], m.vel[1] = vx, vy
+                moved = True
                 break
-        else:
+        if not moved:
             m.vel[0] = m.vel[1] = 0.0
+        floor = W.surface(m.pos[0], m.pos[1])
+        if m.grounded:
+            if floor < m.pos[2] - 1.5 and W.isprism[W.cell(m.pos[0], m.pos[1])] == 0 and floor < m.pos[2] - 3:
+                m.grounded = False          # walked off an edge
+            else:
+                m.pos[2] = floor
+        if not m.grounded:
+            m.vz -= M["gravity"] * DT
+            m.pos[2] += m.vz * DT
+            if m.pos[2] <= floor:
+                m.pos[2], m.vz, m.grounded = floor, 0.0, True
         # aim slew
         tr = M["turn_rate"] * DT
         dy = wrap(m.cmd_aim[0] - m.aim[0])
@@ -697,8 +734,9 @@ class Sim:
         stats.update(muzzle_height=7 * (1 + 0.05 * m.cubes), eye_height=8 * (1 + 0.05 * m.cubes))
         return {"type": "obs", "tick": self.tick, "t": round(self.t, 2),
                 "alive": sum(1 for e in self.mechs if e.alive),
-                "self": {"id": m.id, "pos": m.pos[:], "vel": m.vel[:], "aim": m.aim[:], "hp": m.hp,
-                         "max_hp": m.max_hp, "energy": m.energy, "max_energy": 100, "grounded": True,
+                "self": {"id": m.id, "pos": m.pos[:], "vel": m.vel[:2] + [getattr(m, "vz", 0.0)], "aim": m.aim[:],
+                         "hp": m.hp, "max_hp": m.max_hp, "energy": m.energy, "max_energy": 100,
+                         "grounded": getattr(m, "grounded", True),
                          "cubes": m.cubes, "upgrades": [], "weapons": json.loads(json.dumps(m.weapons)),
                          "in_zone": math.hypot(m.pos[0] - zc[0], m.pos[1] - zc[1]) < zr, "stats": stats},
                 "mechs": seen + [{"id": o.id, "kind": "npc", "pos": o.pos[:], "vel": [0.0, 0.0, 0.0], "aim": [0, 0],

@@ -27,7 +27,7 @@ P = {
     "cube_fight_r": 30.0, "weapon_fight_r": 45.0,
     "ffa_evidence": 4.0, "ffa_deaths": 4.0, "ffa_prey_hp": 350.0, "ffa_engage_r": 70.0, "ffa_retreat_hp": 0.5,
     "ffa_retreat_hp_multi": 0.65, "ffa_explore_until": 100.0,
-    "astar_budget": 0.02, "loot_timeout": 20.0,
+    "astar_budget": 0.02, "climb_max": 0.0, "loot_timeout": 20.0,
     "heal_still_hp": 0.8, "seek_hp": 0.7, "lead_mem": 15.0, "hunt_hp": 0.6, "hunt_mem": 10.0, "hunt_r": 220.0, "explore_until": 240.0,
     "latency": 0.08, "vel_window": 1.2, "vel_blend_t": 0.8,
     "hp_w": 0.12, "dist_w": 1.0, "v_lightning": 3.0, "v_laser": 4.0, "v_gun": 2.0,
@@ -113,6 +113,10 @@ class Bot:
         self.loot_commit = None
         self.loot_since = 0.0
         self.partial_goal = None
+        self.nav_jump = False
+        self.nav_boost = False
+        self.climb_base = {}
+        self.climb_fail = {}     # roof goal cell -> failed attempts     # roof goal cell -> ground approach point
         self.unreachable = []    # (t, x, y) goals the pathfinder could not reach
         self.sound_leads = []   # (t, x, y): estimated positions of things we heard
         self.explore = None
@@ -167,7 +171,80 @@ class Bot:
         return [m["pos"][0], m["pos"][1], m["pos"][2] + h]
 
     # ------------------------------------------------------------------ navigation
+    def roof_height(self, q):
+        """Surface height at q if it is a roof (prism top), else None."""
+        c = self.W.cell(q[0], q[1])
+        return self.W.surf[c] if self.W.isprism[c] else None
+
+    def climb_target(self, me, goal):
+        """True when goal is on a roof we are below and could jet up to."""
+        rh = self.roof_height(goal)
+        if rh is None:
+            return False
+        rise = rh - me["pos"][2]
+        lo = 2.0 if me["grounded"] else -0.6   # mid-climb: keep going until we clear the edge
+        return lo < rise <= P["climb_max"]
+
+    def find_base(self, goal):
+        """Nearest ground cell at the foot of the building holding goal."""
+        W = self.W
+        gc = W.cell(goal[0], goal[1])
+        if gc in self.climb_base:
+            return self.climb_base[gc]
+        roof = W.surf[gc]
+        i0, j0 = gc % W.nx, gc // W.nx
+        best = None
+        for r in range(1, 25):
+            for dj in range(-r, r + 1):
+                for di in ((-r, r) if abs(dj) != r else range(-r, r + 1)):
+                    i, j = i0 + di, j0 + dj
+                    if not (0 < i < W.nx - 1 and 0 < j < W.ny - 1):
+                        continue
+                    c = j * W.nx + i
+                    if W.walk[c] and not W.isprism[c] and W.surf[c] < roof - 2:
+                        best = W.center(c)
+                        break
+                if best:
+                    break
+            if best:
+                break
+        self.climb_base[gc] = best
+        return best
+
     def nav(self, me, goal, t, urgent=False):
+        """Move direction toward goal; climbs onto roofs with jump + jets when the goal is up there."""
+        p = me["pos"]
+        rh = self.roof_height(goal)
+        if rh is not None and p[2] >= rh - 0.6 and hyp(p, goal) < 60 and (me["grounded"] or p[2] >= rh + 0.3):
+            # at (or above) roof level: just walk/drift onto it, keep a little lift while airborne
+            ux, uy = norm2(goal[0] - p[0], goal[1] - p[1])
+            if not me["grounded"] and p[2] < rh + 0.5:
+                self.nav_boost = True
+            self.mode_note = "climb"
+            return ux, uy
+        if self.climb_target(me, goal):
+            base = self.find_base(goal)
+            gc = self.W.cell(goal[0], goal[1])
+            if base is not None and self.climb_fail.get(gc, 0) < 2:
+                if hyp(p, base) > (3.5 if me["grounded"] else 9.0):
+                    return self.nav_ground(me, base, t, urgent)
+                rise = rh - p[2]
+                need = (rise / 10.0 + 1.2) * self.cfg["mech"].get("jet_drain", 15) + 10
+                ux, uy = norm2(goal[0] - p[0], goal[1] - p[1])
+                if me["grounded"]:
+                    if me["energy"] < need:
+                        return 0.0, 0.0          # wait at the wall for energy
+                    self.nav_jump = True
+                elif me["energy"] < 2 and p[2] < rh - 0.5:
+                    self.climb_fail[gc] = self.climb_fail.get(gc, 0) + 1
+                    if self.climb_fail[gc] >= 2:
+                        self.unreachable.append((t, goal[0], goal[1]))
+                self.nav_boost = p[2] < rh + 1.0
+                self.mode_note = "climb"
+                return ux, uy
+        return self.nav_ground(me, goal, t, urgent)
+
+    def nav_ground(self, me, goal, t, urgent=False):
         """Move direction (unit 2D) toward goal following an A* path."""
         p = me["pos"]
         if hyp(p, goal) < 2.0:
@@ -255,6 +332,9 @@ class Bot:
     # ------------------------------------------------------------------ main
     def act(self, obs):
         t0 = time.perf_counter()
+        self.nav_jump = False
+        self.nav_boost = False
+        self.mode_note = ""
         t = obs["t"]
         me = obs["self"]
         p = me["pos"]
@@ -414,7 +494,8 @@ class Bot:
                         # replace the lowest-value weapon
                         drop_slot = min((i for i, w in enumerate(weapons) if w),
                                         key=lambda i: WEAPON_VALUE[weapons[i]["kind"]])
-            on_roof = pk["pos"][2] - self.W.ground(pk["pos"][0], pk["pos"][1]) > 3 and abs(pk["pos"][2] - p[2]) > 2.5
+            on_roof = pk["pos"][2] - self.W.ground(pk["pos"][0], pk["pos"][1]) > 3 and abs(pk["pos"][2] - p[2]) > 2.5 \
+                and not (self.climb_target(me, pk["pos"]) and not enemies)
             if on_roof or self.is_unreachable(pk["pos"], t) or not self.safe_inside(pk["pos"], z, t, margin=5, horizon=20):
                 continue
             score = d - v * 25
@@ -430,7 +511,8 @@ class Bot:
             if self.blocked_pickups.get(cb["id"], -1) > t or self.is_unreachable(cb["pos"], t):
                 continue
             d = hyp(p, cb["pos"])
-            if cb["pos"][2] - self.W.ground(cb["pos"][0], cb["pos"][1]) > 3 and abs(cb["pos"][2] - p[2]) > 2.5:
+            if cb["pos"][2] - self.W.ground(cb["pos"][0], cb["pos"][1]) > 3 and abs(cb["pos"][2] - p[2]) > 2.5 \
+                    and not (self.climb_target(me, cb["pos"]) and not enemies):
                 continue
             if not self.safe_inside(cb["pos"], z, t, margin=5, horizon=15):
                 continue
@@ -563,9 +645,13 @@ class Bot:
                 boost = True
 
         # ---------------- walkability / stuck handling
-        if move != (0.0, 0.0):
-            move = self.pick_dir(me, move, z, t)
-        move = self.unstick(me, move, t, act)
+        if self.mode_note == "climb":
+            mode = mode + "+climb"   # straight at the wall: no detours, no unstick
+            self.hist.clear()
+        else:
+            if move != (0.0, 0.0):
+                move = self.pick_dir(me, move, z, t)
+            move = self.unstick(me, move, t, act)
 
         # ---------------- aiming & firing
         fire = [False, False]
@@ -589,8 +675,12 @@ class Bot:
             move = move  # half speed while charging: nothing to do
         if boost and me["energy"] < 12:
             boost = False
+        if self.nav_jump:
+            act["jump"] = True
+        if self.nav_boost:
+            boost = True
         act["move"] = [round(move[0], 3), round(move[1], 3)]
-        act["boost"] = bool(boost and move != (0.0, 0.0))
+        act["boost"] = bool(boost and (move != (0.0, 0.0) or self.nav_boost))
         self.mode = mode
         mf.draw.label(f"{mode} hp{me['hp']:.0f} e{me['energy']:.0f} {(time.perf_counter() - t0) * 1000:.0f}ms")
         return act
